@@ -1,0 +1,374 @@
+name: Release Installers
+
+# Publish platform installers for a tagged release:
+#   Windows  -> pi-setup-windows-x64.exe / pi-setup-windows-arm64.exe (NSIS)
+#   Linux    -> pi-linux-x64.deb / pi-linux-arm64.deb
+#   macOS    -> pi-darwin-x64.dmg / pi-darwin-arm64.dmg (UNSIGNED, not notarized)
+#
+# Why a separate workflow instead of editing build-binaries.yml:
+#   .github/workflows/build-binaries.yml is upstream's release pipeline and
+#   changes constantly (~3x per 15 days). Rewriting it makes every upstream
+#   merge conflict. Instead its `push: tags: ['v*']` trigger is removed here in
+#   the fork (3 lines, top of file) so it no longer fires on tags, and this
+#   file owns installer releases. Keep this file self-contained; do not add
+#   steps to build-binaries.yml.
+#
+# macOS images are produced WITHOUT a developer account, so they are neither
+# code-signed nor notarized; users must bypass Gatekeeper manually.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g., v1.3.0)'
+        required: true
+        type: string
+      source_ref:
+        description: 'Source ref to build/publish (defaults to tag; use only for release recovery)'
+        required: false
+        type: string
+      force_republish:
+        description: 'Delete and re-stage an already-published release of the same tag (destructive; use only for release recovery). Never set by tag push.'
+        required: false
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: release-installers-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+  SOURCE_REF: ${{ github.event.inputs.source_ref || github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  # Cross-compile every platform's binary on Linux, then wrap the Windows and
+  # Linux builds into installers (NSIS + dpkg both run fine on Linux). The
+  # macOS binaries are staged for the macOS job, which is the only place we can
+  # build a .dmg (hdiutil is macOS-only).
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SOURCE_REF }}
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install packaging tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y nsis dpkg-dev zip unzip
+
+      - name: Hydrate release model data
+        run: npm run hydrate:model-data
+
+      - name: Build binaries
+        run: bash scripts/build-binaries.sh --offline-model-data --out "$PWD/binaries-out"
+
+      - name: Verify upstream binary layout the packagers depend on
+        run: |
+          set -euo pipefail
+          # scripts/package-*.sh assume scripts/build-binaries.sh emits
+          # <out>/<platform>/ containing the binary plus its runtime assets.
+          # Fail loudly here if upstream ever changes that layout.
+          for platform in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+            test -x "binaries-out/${platform}/pi" || { echo "::error::missing binaries-out/${platform}/pi"; exit 1; }
+          done
+          for platform in windows-x64 windows-arm64; do
+            test -x "binaries-out/${platform}/pi.exe" || { echo "::error::missing binaries-out/${platform}/pi.exe"; exit 1; }
+          done
+
+      - name: Package Windows NSIS installers
+        run: bash scripts/package-windows.sh "$PWD/binaries-out" "$PWD/release-assets" "${RELEASE_TAG#v}"
+
+      - name: Package Linux .deb packages
+        run: bash scripts/package-deb.sh "$PWD/binaries-out" "$PWD/release-assets" "${RELEASE_TAG#v}"
+
+      - name: Stage macOS binaries for the dmg job
+        run: |
+          set -euo pipefail
+          mkdir -p darwin-staging
+          cp -r binaries-out/darwin-arm64 darwin-staging/
+          cp -r binaries-out/darwin-x64 darwin-staging/
+          ls -R darwin-staging
+
+      - name: Upload macOS staging
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: darwin-staging-${{ env.RELEASE_TAG }}
+          path: darwin-staging/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Windows/Linux installers
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: installers-linux-win-${{ env.RELEASE_TAG }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+  # Build unsigned .dmg images on macOS (hdiutil is macOS-only).
+  package-darwin:
+    runs-on: macos-latest
+    needs: build
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SOURCE_REF }}
+          persist-credentials: false
+
+      - name: Download macOS staging
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: darwin-staging-${{ env.RELEASE_TAG }}
+          path: darwin-staging
+
+      - name: Package macOS .dmg images
+        run: bash scripts/package-dmg.sh darwin-staging "$PWD/release-assets" "${RELEASE_TAG#v}"
+
+      - name: Upload macOS installers
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: installers-darwin-${{ env.RELEASE_TAG }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+  # Install the produced installer on each native OS and verify it runs.
+  smoke-test:
+    runs-on: ${{ matrix.os }}
+    needs: [build, package-darwin]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: installers-linux-win-${{ github.event.inputs.tag || github.ref_name }}
+            kind: windows
+          - os: ubuntu-latest
+            artifact: installers-linux-win-${{ github.event.inputs.tag || github.ref_name }}
+            kind: linux
+          - os: macos-latest
+            artifact: installers-darwin-${{ github.event.inputs.tag || github.ref_name }}
+            kind: darwin
+    permissions:
+      actions: read
+    timeout-minutes: 20
+    steps:
+      - name: Download installer
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ matrix.artifact }}
+          path: installers
+
+      - name: Install and smoke-test
+        shell: bash
+        run: |
+          set -euo pipefail
+          # GNU coreutils `timeout` exists on Linux and Git-Bash-on-Windows
+          # runners, but not on macOS (only gtimeout via brew coreutils). Fall
+          # back to a bash-only watchdog so every platform keeps a bounded run.
+          run_with_timeout() {
+            local secs="$1"; shift
+            if command -v timeout >/dev/null 2>&1; then
+              timeout "$secs" "$@"
+              return $?
+            fi
+            "$@" &
+            local pid=$!
+            ( /bin/sleep "$secs"; kill "$pid" 2>/dev/null ) &
+            local watchdog=$!
+            local rc=0
+            wait "$pid" || rc=$?
+            # Cleanup must tolerate failure: `kill` on an already-exited
+            # watchdog returns 1 and `wait` on a just-SIGTERMed job returns
+            # 143, and either would abort the whole step under `set -e` even
+            # when "$@" itself succeeded. The watchdog's `sleep` may linger
+            # until it expires; the runner reaps orphan processes at step end.
+            kill "$watchdog" 2>/dev/null || true
+            wait "$watchdog" 2>/dev/null || true
+            return "$rc"
+          }
+          case "${{ matrix.kind }}" in
+            windows)
+              # Git Bash is MSYS: without MSYS2_ARG_CONV_EXCL it rewrites "/S" to
+              # "S:/" and "/D=C:\pi-smoke" into a POSIX path list, so NSIS never sees
+              # the silent switch and blocks forever on its GUI wizard.
+              # NSIS itself splits command-line parameters at "/", so a /D value
+              # containing forward slashes is no longer the last parameter and is
+              # silently ignored - the installer then falls back to
+              # $PROGRAMFILES64\Pi and the check below fails. Backslashes are
+              # required; the quotes stop bash from eating them.
+              MSYS2_ARG_CONV_EXCL="*" timeout 300 ./installers/pi-setup-windows-x64.exe /S "/D=C:\pi-smoke"
+              test -f /c/pi-smoke/photon_rs_bg.wasm || { echo "::error::wasm asset missing after install"; ls -la /c/pi-smoke 2>&1 || true; exit 1; }
+              run_with_timeout 120 /c/pi-smoke/pi.exe --version
+              ;;
+            linux)
+              sudo dpkg -i installers/pi-linux-x64.deb
+              test -f /opt/pi/photon_rs_bg.wasm || { echo "::error::wasm asset missing after install"; exit 1; }
+              run_with_timeout 120 pi --version
+              ;;
+            darwin)
+              hdiutil attach installers/pi-darwin-x64.dmg -mountpoint /Volumes/PiSmoke -nobrowse
+              rm -rf /tmp/pi-smoke
+              cp -R /Volumes/PiSmoke/. /tmp/pi-smoke/
+              hdiutil detach /Volumes/PiSmoke 2>/dev/null || true
+              xattr -cr /tmp/pi-smoke/pi 2>/dev/null || true
+              test -f /tmp/pi-smoke/photon_rs_bg.wasm || { echo "::error::wasm asset missing"; exit 1; }
+              run_with_timeout 120 /tmp/pi-smoke/pi --version
+              ;;
+          esac
+
+  # Draft the GitHub Release from the assembled installer set.
+  stage-github-release:
+    runs-on: ubuntu-latest
+    needs: [build, package-darwin, smoke-test]
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_REPO: ${{ github.repository }}
+      FORCE_REPUBLISH: ${{ github.event.inputs.force_republish }}
+    steps:
+      - name: Checkout (for release notes tooling)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SOURCE_REF }}
+          persist-credentials: false
+
+      - name: Download Windows/Linux installers
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: installers-linux-win-${{ env.RELEASE_TAG }}
+          path: release-assets
+
+      - name: Download macOS installers
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: installers-darwin-${{ env.RELEASE_TAG }}
+          path: release-assets
+
+      - name: Generate release notes and checksums
+        run: |
+          set -euo pipefail
+          cd release-assets
+          VERSION="${RELEASE_TAG#v}"
+          node "$GITHUB_WORKSPACE/scripts/release-notes.mjs" extract \
+            --version "${VERSION}" --tag "${RELEASE_TAG}" \
+            --changelog "${GITHUB_WORKSPACE}/packages/coding-agent/CHANGELOG.md" \
+            --out RELEASE_NOTES.md
+          sha256sum \
+            pi-setup-windows-x64.exe \
+            pi-setup-windows-arm64.exe \
+            pi-linux-x64.deb \
+            pi-linux-arm64.deb \
+            pi-darwin-arm64.dmg \
+            pi-darwin-x64.dmg \
+            > SHA256SUMS
+
+      - name: Create draft GitHub Release and upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd release-assets
+          VERSION="${RELEASE_TAG#v}"
+          release_assets=(
+            pi-setup-windows-x64.exe
+            pi-setup-windows-arm64.exe
+            pi-linux-x64.deb
+            pi-linux-arm64.deb
+            pi-darwin-arm64.dmg
+            pi-darwin-x64.dmg
+            SHA256SUMS
+            RELEASE_NOTES.md
+          )
+          for asset in "${release_assets[@]}"; do
+            test -f "${asset}" || { echo "::error::missing asset ${asset}"; exit 1; }
+          done
+
+          existing_release="$(gh release view "${RELEASE_TAG}" --json isDraft --jq .isDraft 2>/dev/null || true)"
+          if [[ "${existing_release}" == "false" ]]; then
+            if [[ "${FORCE_REPUBLISH}" != "true" ]]; then
+              echo "::error::GitHub Release ${RELEASE_TAG} is already published. Refusing to mutate a public release. Re-run with 'force_republish: true' to delete and replace it."
+              exit 1
+            fi
+            echo "::warning::force_republish=true: deleting already-published release ${RELEASE_TAG} to replace it."
+          fi
+          if [[ "${existing_release}" == "true" || "${existing_release}" == "false" ]]; then
+            gh release delete "${RELEASE_TAG}" --yes
+          fi
+
+          gh release create "${RELEASE_TAG}" \
+            --verify-tag \
+            --draft \
+            --title "${RELEASE_TAG}" \
+            --notes-file RELEASE_NOTES.md \
+            "${release_assets[@]}"
+
+  publish-github-release:
+    runs-on: ubuntu-latest
+    needs: stage-github-release
+    permissions:
+      contents: write
+    env:
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Publish staged GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          existing_release="$(gh release view "${RELEASE_TAG}" --json isDraft --jq .isDraft 2>/dev/null || true)"
+          if [[ "${existing_release}" == "" ]]; then
+            echo "::error::Draft GitHub Release ${RELEASE_TAG} does not exist."
+            exit 1
+          fi
+          if [[ "${existing_release}" == "false" ]]; then
+            echo "::error::GitHub Release ${RELEASE_TAG} is already published."
+            exit 1
+          fi
+          gh release edit "${RELEASE_TAG}" --draft=false
+
+  cleanup-draft-github-release:
+    runs-on: ubuntu-latest
+    needs: [build, package-darwin, smoke-test, stage-github-release, publish-github-release]
+    if: ${{ always() && needs.stage-github-release.result != 'skipped' && (needs.stage-github-release.result != 'success' || needs.publish-github-release.result != 'success') }}
+    permissions:
+      contents: write
+    env:
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Delete draft GitHub Release after failure
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          existing_release="$(gh release view "${RELEASE_TAG}" --json isDraft --jq .isDraft 2>/dev/null || true)"
+          if [[ "${existing_release}" == "true" ]]; then
+            gh release delete "${RELEASE_TAG}" --yes
+          fi

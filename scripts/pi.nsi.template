@@ -1,0 +1,78 @@
+!include "MUI2.nsh"
+!include "WinMessages.nsh"
+!include "LogicLib.nsh"
+
+Name "Pi"
+OutFile "@OUT@"
+InstallDir "$PROGRAMFILES64\Pi"
+RequestExecutionLevel admin
+ManifestDPIAware true
+
+!define MUI_ABORTWARNING
+!insertmacro MUI_PAGE_COMPONENTS
+!insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_INSTFILES
+!insertmacro MUI_UNPAGE_CONFIRM
+!insertmacro MUI_UNPAGE_INSTFILES
+!insertmacro MUI_LANGUAGE "English"
+
+; WinMessages.nsh already defines both on modern NSIS (3.x); re-defining aborts
+; the compile ("already defined!"), so only define when missing.
+!ifndef WM_SETTINGCHANGE
+  !define WM_SETTINGCHANGE 0x001A
+!endif
+!ifndef HWND_BROADCAST
+  !define HWND_BROADCAST 0xFFFF
+!endif
+; Broadcast the environment change, but bounded: SendMessage to HWND_BROADCAST
+; blocks until every top-level window has processed it, which never returns
+; (installer hangs forever) when some window on the desktop is not pumping
+; messages - common on CI/headless sessions. /TIMEOUT switches NSIS to
+; SendMessageTimeout so the broadcast is abandoned after 5s instead.
+!macro BROADCAST_ENV_CHANGE
+  SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
+!macroend
+
+Section "Pi (required)" SEC_PI
+  SectionIn RO
+  SetOutPath "$INSTDIR"
+;@FILES@
+  CreateDirectory "$SMPROGRAMS\Pi"
+  CreateShortCut "$SMPROGRAMS\Pi\Pi.lnk" "$INSTDIR\pi.exe" "" "$INSTDIR\pi.exe" 0
+  WriteUninstaller "$INSTDIR\Uninstall.exe"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Pi" "DisplayName" "Pi"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Pi" "UninstallString" "$\"$INSTDIR\Uninstall.exe$\""
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Pi" "DisplayVersion" "@VERSION@"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Pi" "InstallLocation" "$INSTDIR"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Pi" "Publisher" "Pi"
+SectionEnd
+
+Section "Add Pi to PATH" SEC_PATH
+  ReadRegStr $0 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Pi" "OldPath" "$0"
+  ${If} $0 == ""
+    WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$INSTDIR"
+  ${Else}
+    WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$0;$INSTDIR"
+  ${EndIf}
+  !insertmacro BROADCAST_ENV_CHANGE
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Pi" "AddPath" "1"
+SectionEnd
+
+Section "Uninstall"
+  ReadRegStr $0 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Pi" "AddPath"
+  ${If} $0 == "1"
+    ReadRegStr $1 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Pi" "OldPath"
+    ${If} $1 == ""
+      DeleteRegValue HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
+    ${Else}
+      WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$1"
+    ${EndIf}
+    DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Pi" "OldPath"
+    !insertmacro BROADCAST_ENV_CHANGE
+  ${EndIf}
+  Delete "$SMPROGRAMS\Pi\Pi.lnk"
+  RMDir "$SMPROGRAMS\Pi"
+  RMDir /r "$INSTDIR"
+  DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Pi"
+SectionEnd

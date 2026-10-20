@@ -1,9 +1,9 @@
 name: Build Binaries
 
+# Fork change: the `push: tags: ['v*']` trigger is removed so this upstream
+# pipeline no longer runs on tags. Installer releases are owned by
+# release-installers.yml. Keep this edit minimal to avoid merge conflicts.
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       tag:
@@ -14,6 +14,11 @@ on:
         description: 'Source ref to build/publish (defaults to tag; use only for release recovery)'
         required: false
         type: string
+      force_republish:
+        description: 'Delete and re-stage an already-published release of the same tag (destructive; use only for release recovery). Never set by tag push.'
+        required: false
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -218,6 +223,7 @@ jobs:
     env:
       GH_REPO: ${{ github.repository }}
       RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      FORCE_REPUBLISH: ${{ github.event.inputs.force_republish }}
     steps:
       - name: Download GitHub release payload
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -278,10 +284,13 @@ jobs:
 
           existing_release="$(gh release view "${RELEASE_TAG}" --json isDraft --jq .isDraft 2>/dev/null || true)"
           if [[ "${existing_release}" == "false" ]]; then
-            echo "::error::GitHub Release ${RELEASE_TAG} is already published. Refusing to mutate a public release."
-            exit 1
+            if [[ "${FORCE_REPUBLISH}" != "true" ]]; then
+              echo "::error::GitHub Release ${RELEASE_TAG} is already published. Refusing to mutate a public release. Re-run with 'force_republish: true' to delete and replace it."
+              exit 1
+            fi
+            echo "::warning::force_republish=true: deleting already-published release ${RELEASE_TAG} to replace it."
           fi
-          if [[ "${existing_release}" == "true" ]]; then
+          if [[ "${existing_release}" == "true" || "${existing_release}" == "false" ]]; then
             gh release delete "${RELEASE_TAG}" --yes
           fi
 
