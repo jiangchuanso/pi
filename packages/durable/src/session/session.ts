@@ -1,4 +1,4 @@
-import type { Context, JsonValue } from "@earendil-works/chord";
+import { type Context, type JsonValue, Watch } from "@earendil-works/chord";
 import { awaitWithContext, BACKGROUND_CONTEXT, withoutAbortSignal } from "@earendil-works/chord/context";
 import { type Op, track } from "@earendil-works/chord/delta";
 import {
@@ -9,7 +9,7 @@ import {
 	materializeDocument,
 	resolveAddress,
 } from "../documents.ts";
-import { SessionFailed, StorageRequestError } from "../errors.ts";
+import { ReadOnlySession, SessionFailed, StorageRequestError } from "../errors.ts";
 import { idFromNumber } from "../ids.ts";
 import { hostTimers, type Timers } from "../timers.ts";
 import type {
@@ -56,8 +56,10 @@ import type {
 	TaskRecord,
 	Tx,
 } from "../types.ts";
-import { CommittedWatch, type ObservedDocumentValue } from "./observation.ts";
 import { type LoadedDocument, Transaction, type TransactionHost, type TransactionScope } from "./transaction.ts";
+
+/** What a document watch observes: the committed value of its incarnation, `null` once it retired. */
+type ObservedDocumentValue = Readonly<JsonObject> | null;
 
 /** The default source of a report: a listener, which never fails what ran it. */
 const LISTENER: ReportInfo = { type: "listener_error" };
@@ -121,6 +123,8 @@ export class SessionImpl implements Session {
 	readonly #attachedDocuments = new Map<DocumentId, number>();
 	readonly #clock: () => number;
 	readonly #documentRetentionMs: () => number;
+	/** Refuse every commit with writes (`HarnessOptions.readOnly`). */
+	readonly #readOnly: boolean;
 	readonly #timers: Timers;
 	/** The pending eviction: a timer for the oldest idle document, or a line job when the retention is 0. */
 	#documentSweep: { readonly at: number; disarm: (() => void) | undefined } | undefined;
@@ -158,9 +162,11 @@ export class SessionImpl implements Session {
 		now: () => number = Date.now,
 		documentRetentionMs: () => number | undefined = () => undefined,
 		setTimer?: SetTimer,
+		readOnly = false,
 	) {
 		// Waits race it; none has to.
 		this.#failed.promise.catch(() => {});
+		this.#readOnly = readOnly;
 		this.#storage = new GuardedStorage(storage, this);
 		this.#timers = hostTimers(setTimer, (error) => this.report(error, { type: "host_error", callback: "setTimer" }));
 		// Cache bookkeeping must never change the outcome of the operation it follows: a clock or a retention setting
@@ -675,6 +681,12 @@ export class SessionImpl implements Session {
 			this.#sweepDocuments();
 			return result;
 		}
+		if (this.#readOnly) {
+			// Refused before Storage: the Session stays healthy, and the caller sees why.
+			tx.discard();
+			this.#sweepDocuments();
+			throw new ReadOnlySession("a commit with writes");
+		}
 		// Storage adopts the batch synchronously once it is durable, before its next commit; a throw here would reach
 		// Storage, so the callback keeps its own error.
 		let adoption: { readonly documents: DocumentCommitChange[] } | { readonly error: unknown } | undefined;
@@ -765,10 +777,7 @@ export class SessionImpl implements Session {
 	 * Attach a watch to one committed incarnation: check the definition, then forward this incarnation's committed
 	 * changes, its retirement, and close. The watch's detach removes both subscriptions.
 	 */
-	#attachDocument(
-		definition: AnyDocToken["definition"],
-		loaded: LoadedDocument,
-	): CommittedWatch<ObservedDocumentValue> {
+	#attachDocument(definition: AnyDocToken["definition"], loaded: LoadedDocument): Watch<ObservedDocumentValue> {
 		checkRecordScope(definition, loaded.record);
 		checkRecordVersion(definition, loaded.record, loaded.storedVersion);
 		let unsubscribeCommit = (): void => {};
@@ -780,9 +789,7 @@ export class SessionImpl implements Session {
 			unsubscribeClose();
 			unpin();
 		};
-		const observer = new CommittedWatch<ObservedDocumentValue>(loaded.tracker.value, detach, (error) =>
-			this.report(error),
-		);
+		const observer = new Watch<ObservedDocumentValue>(loaded.tracker.value, detach, (error) => this.report(error));
 		const observed = { version: loaded.valueVersion };
 		unsubscribeCommit = this.observeCommits((publication, context) => {
 			for (const change of publication.changes) {
