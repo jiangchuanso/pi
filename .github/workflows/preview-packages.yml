@@ -23,6 +23,7 @@ jobs:
     if: >-
       github.event_name == 'workflow_run' && github.event.workflow_run.conclusion != 'cancelled' &&
       github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.repository == 'earendil-works/pi' &&
       ((github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main') ||
       github.event.workflow_run.event == 'pull_request')
     # Publish and cleanup runs for the same branch execute one at a time, in order. The group is set per job, so runs
@@ -96,7 +97,8 @@ jobs:
     # Only PRs into main: pull_request_target runs this file from the PR's base branch, and only main is allowed.
     if: >-
       github.event_name == 'pull_request_target' && github.event.pull_request.base.ref == github.event.repository.default_branch &&
-      github.event.pull_request.head.repo.full_name == github.repository
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.repository == 'earendil-works/pi'
     concurrency:
       group: preview-packages-${{ github.event.pull_request.head.ref }}
       queue: max
