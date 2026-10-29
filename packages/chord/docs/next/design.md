@@ -89,7 +89,9 @@ worker worker worker      addressable by a typed address, started on demand
 | worker | yes, many | stamped by the parent | started on demand by the app |
 
 Clients serve only `local` types (they are not addressable): a host without a principal refuses to serve a remote type
-(`load` throws; a remote object is owned by a principal of the host serving it; owner, 2026-10-24). A client's local
+(`load` throws; a remote object is owned by a principal of the host serving it; owner, 2026-10-24). No client providers for now (owner,
+2026-10-28): client-side capabilities (a camera, WebMCP tools) go through an owner's requests that clients answer
+(section 20, the Questions service). A client's local
 calls have no principal; what a client calls on the server is stamped with the client's authenticated principal.
 Clients reach workers only through the server, which relays; workers reach each other through the server too. A
 detached process (e.g. a terminal host) would be another child kind of the server. Things that are not hosts: a code
@@ -132,7 +134,8 @@ export const Catalog = remote("catalog", { placement: () => Server(), … });
   | an arriving hold for a served type whose params place it on another host | broken `invalid/placement`; the address the hold names only routes it |
   | the hold names an address of a kind this host has a route for | over that route's link (the address's params checked against the kind, then `authorize`) |
   | otherwise (a remote type) | over the parent link; a hold that arrived *on* the parent link is never sent back to it: `unavailable` |
-  | no parent link | `unavailable` |
+  | no parent link: the host never had one | `unavailable` |
+  | no parent link: it is down (a drop) | waits on the parent path, `loading`, until the next link (design audit, 2026-10-27) |
 
   A `placement` or `authorize` that throws fails the hold broken with that error; an address whose params fail the
   kind's check is broken `invalid/placement`.
@@ -201,12 +204,13 @@ parent link closes. `resolve` returns the link before the worker has loaded (the
 | `load([{ name, facet }], context)` | facets with their plugin names (the plugin's `package.json` name, npm style; duplicates and invalid names are refused); runs every facet's setup, then waits for the start barrier (section 21); a throwing setup rejects and closes the host; runs once. Loaders are adapters; base code passes its core facet the same way |
 | `connect(link, { principal, trusted?, codec? }, context)` | the link to the parent, at most one open; once it closed (a drop), `connect` takes the next, and every remote reference over the parent is held again on it. `principal` = who the parent is |
 | `accept(link, { principal, trusted?, codec? }, context)` | a link from a child; holds and calls on it act as `principal` |
-| `route(Kind, { authorize, resolve })` | how to reach hosts of a kind (below); called before `load`, once per kind |
+| `route(Kind, { authorize, resolve }, context)` | how to reach hosts of a kind (below); called before `load`, once per kind; work arriving on its links runs under `context` |
 | `get(Type, params, context, { readyTimeout? })` | a reference once its object is live (section 7) |
 | `hold(Type, params, context, { readyTimeout? })` | a reference at once that follows its object until released (section 7) |
 | `close(context)` | closes the links (children, routes, then the parent), then ends every object at once and tears them down, the last to go live first (reason `close`); rejects with an `AggregateError` of the native closes that threw |
 | `revoke(r, context)` | revocation (section 4; slice 4b) |
-| `root(fn, …)` | a call scope for code outside objects (a Durable hook, a CLI); built in slice 8 (**decision needed** on its signature, section 26) |
+| `root(fn, context, { principal? })` | a call scope for code outside objects (a Durable hook, a CLI): `fn` gets a handler's `ctx`, sealed when `fn` settles, `context` aborts or the host closes (slice 8 D3, section 8) |
+| `registry(R, context)` | registry `R`'s composed value for code outside objects; waits for `load`, rejects when it has none (slice 8, section 17) |
 
 **Options of `createHost`:** `address`, `principal`, `principalKey` (section 4; the same function on every host),
 `telemetry` (section 29), `onError`, `closeTimeout`, `readyTimeout`, `heartbeat: { ping?, close? }`; later `revokedBy`
@@ -215,7 +219,7 @@ and closed by the app with `store.close(ctx)` after `host.close`; the host never
 background, as a tagged `HostError`: `listener_error` (a watch listener threw), `delivery_failed` (a frame delivery
 threw), `activation_failed { object, failure }`, `close_failed { object, native, error }`, `close_timeout { object,
 native }`, `drain_timeout { object }`, `protocol_error { error }`, `resolve_failed { address, error }`; later routine
-errors (slice 5), `derive_failed { object, member?, error }` (a derive's compute threw, once per failure episode, slice 6a), `object_failed { object, failure }` (a live object failing, slice 6a; `failure` where the value is a `FailureCause`, `error` otherwise, 2026-10-27) and `storage_failed { error }`
+errors (slice 5), `derive_failed { object, member?, error }` (a derive's compute threw, once per failure episode, slice 6a), the registries' `registry_conflict { registry, message, plugins }`, `registry_failed { registry, error }`, `contribution_failed { registry, plugin, type?, error }` and `contribution_refused { registry, plugin, type?, version }` (each once per episode, slice 8), `object_failed { object, failure }` (a live object failing, slice 6a, `broken`; `transient` when a `self.follow` source failed, slice 6b R4; `failure` where the value is a `FailureCause`, `error` otherwise, 2026-10-27), `job_interrupted { object, job, id, restarts }` (a persisted run ended at the restart limit, slice 6b D6) and `storage_failed { error }`
 (slice 6a), which every app must handle: Chord never ends the process,
 the app exits with its own code for its supervisor or reopens.
 
@@ -272,8 +276,7 @@ host.route(Session, {
   completed its handshake resets the backoff. Without holds for the address nothing is resolved again, so passive
   viewers recover without a user action while they hold.
 - Chord never closes a route link itself except at `host.close`; stopping idle workers is the app's (`host.activity`).
-- Route links have no app context yet: work arriving on them runs under the background context without telemetry
-  (slice 4b gives routes a context).
+- Work arriving on a route's links runs under the context given to `host.route(Kind, options, context)` (slice 4b).
 
 ### Links
 
@@ -452,7 +455,7 @@ drops, folds or resets.
   server.revoke({ grant: "g1" }, ctx);
   ```
 
-  `host.revoke(r)` ends every object and closes every link whose principal `p` has `r` in `revokedBy(p)` (compared by
+  `host.revoke(r)` ends every object and closes every child link whose principal `p` has `r` in `revokedBy(p)` (compared by
   canonical JSON of each value `revokedBy` returns, computed once per principal; never the host's own principal), and propagates `r` to the children as a `revoke` message on its route links,
   honoured only on a child's parent link, where each applies its own `revokedBy` (the same app code; nothing is
   replayed to a child connected later). Holders of a revoked object get `gone` with `forbidden/revoked` (owner,
@@ -546,7 +549,7 @@ host.serve(Notes, ({ session }, principal, self) =>
   link protocol (adding one bumps the protocol version; a receiver rejects unknown reasons; a test pins the list):
   `invalid` (`args`, `params`, `member`, `placement`, `reentrant`, `read_after_bulk`, `cycle`), `contract_mismatch`
   (`updating`), `forbidden` (`revoked`), `gone`, `not_ready`, `released` (`ended`, `closed`, `settled`, `version`, `discarded`; none for a holder's own release), `too_large` (`part`), `unavailable` (`locked`,
-  `park_timeout`, `busy`, `storage_failed`), `aborted`. A failed check names TypeBox's instance path ("unknown field", "missing", else TypeBox's
+  `park_timeout`, `busy`, `storage_failed`, `undeclared`: a registry no plugin serves here, slice 8), `aborted`. A failed check names TypeBox's instance path ("unknown field", "missing", else TypeBox's
   message; keys containing `/` or `~` make the path ambiguous, documented). Plugins throw `PluginError(code, message,
   details?)` for codes of their own; anything else crosses a link as the plugin code `internal` with its message, never
   a stack or a cause; plugin errors never use Chord's codes. An error rebuilt from the wire is not copied and only its
@@ -574,7 +577,8 @@ host.serve(Notes, ({ session }, principal, self) =>
   `remote` type lives while referenced (`linger` keeps it briefly after the last reference). No remote object has host
   lifetime: its identity includes the principal, and long-lived parts belong in a local shared store. Below,
   "host-lifetime object" means a `local` object with empty params. Running and finishing job runs keep their
-  object alive as a count, not as references; when the count reaches zero with no holders, the object ends (§15).
+  object alive as a count, not as references, while an attempt is live or activating ("Slice 6a small items" (12)); when
+  the count reaches zero with no holders, the object ends (§15).
 - **Activation** (one fresh attempt each time, bounded by `readyTimeout`, its wait for the previous instance's
   teardown included): the factory runs; singleton documents take `initial()` and, on the object's first activation,
   persisted documents load and its tables' definitions are checked and migrated (slice 6a; the deadline paused during
@@ -586,8 +590,8 @@ host.serve(Notes, ({ session }, principal, self) =>
 - **The seal fence** (owner, 2026-10-26): every attempt has a seal token (a job run invocation its own, for its state
   changes and outcome). After the seal, new work through the attempt's handles is refused at use (`self.tx`, `ctx.get`,
   a job or routine start); commits are checked when they enter the store's commit step (sealed: rejected `released`,
-  nothing written) and at adopt (sealed during the SQL: durable, adopted into the object's documents, staged job
-  changes abandoned); at the seal a transaction not yet in the step is aborted and the line released, a started step
+  nothing written) and at adopt (sealed during the SQL: durable, adopted into the object's documents, its staged job
+  changes adopted into the object too: decision "Second spec review: the majority" (3)); at the seal a transaction not yet in the step is aborted and the line released, a started step
   finishes before teardown completes; cleanup (references, presence, activity counts) still runs. A pure swap is not a
   replacement.
 - **Ending** (slice 1, 2): new calls are rejected; every caller of a running call gets `released` at once; the
@@ -604,7 +608,10 @@ host.serve(Notes, ({ session }, principal, self) =>
   reload or `ref.retry()`; live dependents stay live. The members freeze only after the commits admitted before the
   seal adopted and published once, and a retry's factory waits for that (2026-10-27, slice 6a build reviews).
 - **Waiting for dependencies (R18):** an object whose references are not live yet stays `loading` and goes live as
-  soon as they are (bounded by `readyTimeout`). A dependency that fails (`broken` or `transient`), or does not become
+  soon as they are (bounded by `readyTimeout`; a link drop while a dependency is still loading is no failure: the
+  reference re-holds on the next link and the dependent keeps waiting, design audit 6, 2026-10-27). A dependency
+  going live while the dependent still activates is remembered and retries it at once if that attempt fails. A
+  dependency that fails (`broken` or `transient`), or does not become
   live in time, fails the dependent **`transient`** with the dependency's cause inside, never `broken`: the cause is
   the dependency's. The dependent keeps its references while failed, and Chord installs their state as an automatic
   retry trigger: the moment the dependency goes live, the dependent is retried at once (the remaining backoff is
@@ -713,7 +720,7 @@ location are dropped.
   of its variant has a value). A broken failure rejects at once; through transient ones it waits up to its
   `readyTimeout`, then rejects with the last failure's error; a getter that gives up releases its reference.
   **`host.hold`** returns a reference at once that follows its object until released (loading, live, failed and
-  retried as its object is, loading again while its link is down) and never rejects; invalid params and a local type
+  retried as its object is, loading again while its link is down) and never rejects; invalid params (checked at once, also before `load`: design audit 7, 2026-10-27) and a local type
   not served here throw at once (before `load` resolved, these fail the reference broken once it did); its `variant` is
   `undefined` until its first binding (slice 3b). There is no `state: false` option (C8) and no `optional` flag.
 - **Narrowing by variant:** `ref.variant` is the discriminant (C15: no `inVariant`/`expectVariant`); `RefIn<C, V>`
@@ -744,7 +751,8 @@ location are dropped.
 | object `failed` | reject at once with the cause | `failed` with cause and `retryAt` |
 
 - A failed reference stays alive: while held, Chord retries per the backoff; `ref.retry()` tries at once (a Retry
-  button; over a link the `retry { hold }` message); success goes `loading`, then `live`. A provider tells a pending
+  button; over a link the `retry { hold }` message, which also re-runs a refused hold's start: authorize, placement,
+  binding; design audit 2026-10-27); success goes `loading`, then `live`. A provider tells a pending
   hold's consumer each failure (`failed`, with the rest of its backoff window) and the next attempt (`loading`).
 - **Parked calls** (slice 3b): calls made while the reference is loading are queued in order, each waiting at most the
   reference's `readyTimeout` from the moment it was made (never renewed), then fail `unavailable/park_timeout`; they
@@ -1024,8 +1032,12 @@ host.serve(DraftStore, (_, self) => {               // local, empty params: may 
 - **Statements per commit (owner, 2026-10-26):** the store keeps `lastSeq` (the seq of its last commit) in memory (read at open,
   persisted with each commit, S9) and folds the documents engine's checks into the writes (unique keys, a partial
   unique index on the live address, conditional `UPDATE … WHERE id = ? AND version = ?`): a delta commit is about three
-  statements (revision, the record's counted conditional `UPDATE`, `lastSeq`), plus one `INSERT` with an outbox. Durable's ids in the store: `StoreStorage` keeps a `record_ids` table (one
-  namespace across Durable's five tables), its counter at open `coalesce(max(id), 1) + 1`.
+  statements (revision, the record's counted conditional `UPDATE`, `lastSeq`), plus one `INSERT` with an outbox. Durable's ids in the store (slice 6b D3): one id allocator per store
+  for every id (Durable's `mintId` and Chord's document ids; it starts at 2, saturates at `Number.MAX_SAFE_INTEGER`, each
+  commit persists it, outbox commits and archives carry it as `nextId`); `StoreStorage`'s `record_ids` table only checks
+  an id's record type. Every table and document namespace in the store is claimed once (slice 6b "owner names and
+  claims"): a table by its SQL name `"<owner>:<table>"`, documents by `(owner, namespace)`; an object claims under its
+  type, `StoreStorage.open(store, owner, ctx)` under `owner` (two harnesses on one store under two names are fine).
 - **Tables in a transaction (owner, 2026-10-26):** the table handle first, keys as objects with exactly the key
   columns, reads async, writes synchronous and buffered like a draft's ops (checked and staged, no I/O; written in the
   commit step or dropped on failure); no write shorthands on the handle:
@@ -1145,7 +1157,7 @@ type NativeWatchCall<T> = { kind: "value"; value: T } | { kind: "failed"; error:
   map; `r` drops everything before it); past 10,000 pending ops only "replace with the current value" is kept (no
   size, text or time caps; no folding of list appends or trims; ops come only from Chord's tracker and
   `diffRevisions`, so there are no defences against hand-written ops). `PendingOps` is Chord's shared Delta code. The
-  same queue holds a link hold's ops while its window is full (section 3). Natives: the newest value. Durable's
+  same queue holds a link hold's ops while its window is full (section 3). Natives: every value in order, past 100 pending values one call with the newest (W4). Durable's
   event stream keeps its own queue (events are not state); `stop()` is idempotent, drops pending frames, never aborts or awaits a running call; `stop()` and
   `closed` return the end, tagged by `kind` (owner, 2026-10-27): `stopped`, `aborted` (its context aborted), `ended`,
   `listener_error { error }`, `failed { error }` (a final failure; a recoverable one is a call). Durable's synchronous
@@ -1206,8 +1218,8 @@ source (W1); a dirty derive nobody holds recomputes on its next read. A throwing
   comparisons, not content comparisons:
 
   ```ts
-  const strip = mapShared((n: Note) => ({ text: n.text, at: n.at }));
-  self.derive([notes], ([n]) => ({ list: n.list.map(strip) }));
+  const strip = mapShared((n: Note) => ({ text: n.text, at: n.at }));   // a mapper over the whole array
+  self.derive([notes], ([n]) => ({ list: strip(n.list) }));
   // one appended note: one new object, 2,000 identical references, diffRevisions emits one insert
   ```
 
@@ -1342,7 +1354,7 @@ host.serve(ChatStore, ({ conversation }, self) => {          // local: no princi
   const shell = self.job(ShellJob, {
     run: async ({ command }, ctx) => {
       const out = new OutputBuffer({ maxLines: 2000, retain: "tail" });
-      const progress = throttle(100, () => ctx.state.change((d) => { d.output = out.snapshot().text; }));
+      const progress = throttle(100, () => ctx.state.change((d) => { d.output = out.snapshot().text; }, ctx));
       try {
         const r = await runProcess(command, ctx.abortSignal, (chunk) => { out.push(chunk); progress.schedule(); });
         return { exit: r.code, output: out.snapshot().text };
@@ -1381,7 +1393,7 @@ host.serve(ChatStore, ({ conversation }, self) => {          // local: no princi
   the run, both or neither). `run` starts after the commit.
 - **2. Run:** `run(args, ctx)` may do anything, outside transactions. `ctx` is a `Ctx` (the object's principal for a
   remote type, the host's for a local one) plus `jobId` and `state`: `ctx.state.value` (synchronous) and
-  `ctx.state.change(fn)` (a transaction on the owner's line on the run's document, without the run's abort signal).
+  `ctx.state.change(fn, ctx)` (a transaction on the owner's line on the run's document, without the run's abort signal).
   State changes are accepted until `run` settles, also after an abort (so output written while stopping still reaches `outcome.state`), and are
   refused (`released`) afterwards, never recreating a retired document. Each change is a commit and, while someone
   watches, a message: authors throttle frequent changes themselves (Chord does not coalesce them); awaiting or
@@ -1490,13 +1502,13 @@ export default defineFacet((host, self) => {         // `self` (contributions) a
 ## 17. Registries
 
 ```ts
-export const Http = defineRegistry<HttpContribution, Router>("chord.http", {
-  version: 2,
-  accepts: { 1: (old: HttpContributionV1): HttpContribution => upgrade(old) },
-  compose: (table, { report }) => buildRouter(table, report),   // pure; always delivers a value; reports conflicts
+export const Http = defineRegistry<HttpContribution, Router>("chord.http", { version: 2 });   // shared: identity only
+host.serve(Http, {                                             // the defining plugin's facet: the one provider (slice 8 D1)
+  compose: (table, { report }) => buildRouter(table, report),  // pure; always delivers a value; reports conflicts
+  accepts: { 1: { contribution: (old: HttpContributionV1) => upgrade(old), value: (router) => routerV1(router) } },
 });
 self.contribute(Http, { routes: { … }, wraps: [ … ] });
-const router = host.registry(Http).value;     // live
+const router = self.registry(Http);           // a declared dependency; read router.value at use (await host.registry(Http, ctx) outside objects)
 ```
 
 - Each contributor (a facet or an object) contributes **at most one value per registry**; the table is an immutable,
@@ -1509,9 +1521,12 @@ const router = host.registry(Http).value;     // live
   `compose(table, { report })` is pure and runs whenever the table changes (after a commit, when a contributor goes
   live or ends, when a dynamic contribution changes). It always delivers a value with its fallback built in (e.g. the
   first by plugin name wins) and reports conflicts through `report` (owner notices and telemetry events); readers get
-  a plain value and never handle conflicts. Only if `compose` throws is the registry in an error state, and readers
-  get an error when they use it. Work that started earlier keeps the value it read (a pinned Durable phase keeps its
-  old table). Helpers: `keyed(table, entriesOf)`, `ordered(table, itemsOf, orderOf?)`.
+  a plain value and never handle conflicts. If `compose` throws, the failure is reported and its
+  watches get a `failed` call, while `.value` keeps the last good composition (slice 8); only before any good
+  composition do readers get the error. Work that started earlier keeps the value it read (a pinned Durable phase keeps
+  its old table). Helpers: `keyedEntries(table, entriesOf, report)` (a map, the first by plugin name wins, a duplicate
+  reported), `orderedEntries(table, itemsOf, orderOf?)`; both keep each item's plugin (named so beside the contracts'
+  `keyed`, slice 8 build).
 - **Who contributes (R21):** only facets and host-lifetime objects (`local`, empty params); their factory's `self` has `contribute`, a
   referenced object's `self` does not (a type error). Reading a registry's composed value stays open to every object.
 - **A contribution is in the table exactly while its contributor is live:** a facet's while its plugin is loaded; an
@@ -1531,6 +1546,12 @@ const router = host.registry(Http).value;     // live
   use site catches synchronous throws and rejections when it calls an entry, reports naming the contributor (the
   composed table keeps each entry's plugin name), and continues with the other entries. Durable already does this for
   extensions (`extension_error`; a throwing tool becomes an error result); `compose` reports through `report`.
+- **Slice 8's rules** (decisions "Slice 8 D1" to "Slice 8 S3", `slice-8.md`): the token is shared, the provider serves it
+  (`host.serve(R, { compose, accepts })`); `self.registry(R)` in a factory is a declared dependency (activation waits
+  for a value; with none after `load`, the reader fails `transient` and is retried when one arrives); contributions
+  never fail a registry (a failed one is left out and reported); a throwing `compose` keeps the last good composition;
+  older readers get the value mapped back (`accepts[old].value`); `retryOn` retries on value calls only; `host.root(fn,
+  context, { principal? })` seals its context at settle, abort and `host.close`.
 - **Registries may carry natives.** An entry lives exactly as long as its contributor; consumers look up at each use
   or follow the composed value and keep nothing from an entry beyond a use.
 - **Contributions that change (owner, 2026-10-19; W4):** registries are host-local, so contributions are usually
@@ -1775,7 +1796,8 @@ validation, no clone of snapshots or ops.
   | Kind | Direction | Fields |
   | --- | --- | --- |
   | `hello` | both, first | `protocol`, `incarnation`, `calls` (the call window N) |
-  | `hold` | to provider | `origin?`, `hold`, `type`, `version`, `fingerprint`, `params` (part), `address?`, `principal?`, `incarnation?` |
+  | `hold` | to provider | `origin?`, `hold`, `type`, `version`, `fingerprint`, `params` (part), `address?`, `principal?`, `incarnation?`, `chain?` (activation chain, Q5), `limit?` (decoded size limit, 4b) |
+  | `revoke` | parent to child (route link) | the revocation value (4b) |
   | `release`, `retry` | to provider | `origin?`, `hold` |
   | `call` | to provider | `origin?`, `call`, `hold`, `method` (index), `args?` (part; absent: no arguments), `segments?` |
   | `abort` | to provider | `origin?`, `call` (named `cancel` until 2026-10-27) |
@@ -1928,11 +1950,14 @@ loop. Chord has no stream type (it would need its own rules for drops, cancellat
   access and execution environments from registry entries, looked up at each use:
 
   ```ts
-  const harness = self.open(async (context) => Harness.open(new StoreStorage(store), {   // the host's store (slice 6b)
-    models: () => host.registry(HarnessModels).value,
-    env: (target) => host.registry(HarnessEnvironments).value(target.cwd),
+  const models = self.registry(HarnessModels);              // declared dependencies (slice 8 S3): activation waits
+  const envs = self.registry(HarnessEnvironments);
+  const extensions = self.registry(HarnessExtensions);
+  const harness = self.open(async (context) => Harness.open(await StoreStorage.open(store, Harness.name, context), {
+    models: () => models.value,                              // read at use
+    env: (target) => envs.value(target.cwd),
     settings: () => currentSettings(),
-    registry: durableRegistry(host.registry(HarnessExtensions)),   // a RegistryReader over the composed NativeWatchable
+    registry: registryReader(extensions, context),           // Durable's RegistryReader over the composed value (slice 8)
   }, context), (h, _reason, context) => h.close(context));
   ```
 
@@ -1942,14 +1967,20 @@ loop. Chord has no stream type (it would need its own rules for drops, cancellat
   loading object (refines R17). A missing tool gives its call an error result the model sees; a missing model makes the generation
   report "model unavailable" and wait (not fail) until a model contribution appears; a task whose definition is missing
   stays blocked (`missing_task`) until the plugin is installed or the task is aborted, as Durable does.
+- **Durable's views from other objects** (slice 8 §5): the harness object contributes its `Native<Harness>` to a
+  registry of p3's; another object declares that registry (`self.registry`), wakes on it (`self.retryOn`) and follows
+  a view through its value (`self.follow`). A Session close ends Durable's synchronous observers `failed` ("session
+  closed"; decision "Slice 8 S1"; app watches still end `ended`), so the follower fails `transient` and follows the
+  next Harness once its contribution arrives. `registryReader`'s listener runs inside Chord's batch: it only wakes
+  Durable's scheduler (a Chord call there throws `invalid/reentrant`).
 - `HarnessModels` and `HarnessEnvironments` start with one contribution each, from the models and envs plugins'
   objects that own the natives; several providers or environment kinds are their `compose`. After a models reload
   the next request uses the new runtime; a running stream finishes on the old one.
 - **Chord from Durable code (Q6):** tools, hooks and sections get Durable's `ToolExecutionApi` and a `Context`, never a
   Chord `ctx`. p3's core opens the harness with a base context holding the host under a typed key
   (`withContextValue(ChordHostKey, host, …)`); every phase context inherits it. A core helper opens a call scope from
-  any Durable context: `chord(async (ctx) => …, context)` = `host.root(fn, { signal: context.abortSignal, telemetry:
-  context.telemetry })` (host principal; attribution as data; references released when `fn` settles). No wrapping of
+  any Durable context: `chord(async (ctx) => …, context)` = `host.root(fn, context)` (host principal; attribution as
+  data; references released when `fn` settles; slice 8 D3). No wrapping of
   tools and no p3 `defineTool`. Clients are never reachable this way (they are not addressable): a tool that needs the
   user goes through an owner's state, e.g. the Questions service (`apps/p2/docs/questions.md`): the model-facing
   `ask_user` tool and any other tool call `Questions.ask`/`wait`, tabs render the open questions and `answer` them.
@@ -2015,7 +2046,6 @@ this document):
 | 14 | project plugins | 21 | own pass over `plugin-loading.md` |
 | 16 | a Durable Object profile | 24 | when a DO target becomes concrete |
 | 24 | the rollout install timeout (60 s) and a per-type drain override: host options or fixed (the routine handover uses `closeTimeout`; a failing job `finish` backs off 1-60 s and blocks after five failures, decided) | 3 | with slice 7 |
-| 25 | `host.root` signature (`root(fn, context, { principal? })` proposed) and what an aborted, uncooperative `fn` means for its references (match the handler and `CallContext` rules) | 3, 24 | slice 8 |
 | 26 | how a migration commit reaches consumers (`[["r", value]]` per changed member, or a fresh `bound`; adapted by `accepts` for older consumers) | 21, 22 | slice 7 |
 | 28 | Astra's circuit breaker (a hard transport-buffer cap plus a stall deadline); the heartbeat is built, the cap was never decided | 3 | if a real case needs it |
 | 29 | round-3 cut C11 (`ctx.trace`); C3 and C4 are decided (§14, §15) | 8 | slice 9 |

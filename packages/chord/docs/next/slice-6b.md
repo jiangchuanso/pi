@@ -1,12 +1,7 @@
 # Slice 6b: Durable and jobs on the store (spec)
 
-Status: **revised after the first spec review** (2026-10-27): D1-D9 and R1-R4 decided by the owner (decision log,
-entries "Slice 6b …" and "owner names and claims"); the four reviews (`/tmp/s6b-review-{astra,fable,opus,sol}.md`)
-kept every decision and found the gaps this revision closes. Written by the redesign session after reading, in full,
-Durable's `types.ts`, its SQLite storage, schema and migrations, the storage conformance suite and benchmark,
-`session/session.ts`, `session/transaction.ts`, `session/forks.ts`, the scheduler's restarts, `writeAtClose` and `abort`,
-and Chord v2's store, engine, applier, commit step and jobs. Durable's memory, JSONL and IndexedDB storages stay as they
-are (S15).
+Status: **built** (2026-10-28, pi `14b4c56e5`: one build, a build review and two fix rounds by the four spec reviewers;
+reopen, the one-entry commit's mean and the resume watch's CPU accepted by the owner). Was: ready to build (2026-10-27).
 
 The single source for building 6b, together with `design.md` read in full; the decision log `decisions.md` (later
 entries win), in particular "The store", S1, S2, S4, S10, S11, S13, S15, W1, W12, "Slice 6 first decisions", "Durable's
@@ -53,10 +48,14 @@ Every item below changes 6a's code; nothing is deployed, so the schema and the a
 
 - Tables are `"<owner>:<table>"` (`"notes.store:edits"`), document owners `"<owner>"`; no host kind. The applier and
   import check two name parts.
-- Every owner name is claimed once per store (in memory, for the store's lifetime): an object claims its type when it
-  first declares persisted data; `StoreStorage.open` claims its name; a second claim is refused `invalid/args`; a
-  claim is released by its owner's end (`StoreStorage.close`, the object's end), so a new Session can reopen over the
-  same store.
+- **Claims** (owner, 2026-10-27, decision "owner names and claims", refined): what can collide is claimed once per
+  store, in memory: a table by its SQL name, documents by `(owner, namespace)`. An object claims its tables and
+  `(type, "chord")` (plus `chord.jobs` and `chord.job-states` with persisted jobs) when it declares them;
+  `StoreStorage.open` claims its five tables and its document namespaces (Durable's scopes contain a `:`, Chord's
+  namespaces never do). A second claim is refused `invalid/args`; a claim is released by its owner's end
+  (`StoreStorage.close` after its calls underway drained, the object's end), so a new Session can reopen over the same
+  store. So the object that opens Durable can declare its own persisted data under the same owner name, and two
+  harnesses can share a store under two owner names.
 
 ### 1.2 One id allocator (D3)
 
@@ -67,8 +66,10 @@ Every item below changes 6a's code; nothing is deployed, so the schema and the a
 - It starts at 2 (id 1 is Durable's root conversation). It saturates at `Number.MAX_SAFE_INTEGER`: an explicit write of
   that id is accepted, the persisted value stays `MAX_SAFE_INTEGER`, every later `mintId` rejects "ID space is
   exhausted", and a Chord creation at the saturated allocator refuses its own commit (1.4).
-- Outbox commits carry the allocator's value after them (`{ seq, nextId, writes }`); the archive manifest's
-  `nextDocumentId` is `nextId`; import and batch apply restore it, so a replica mints above every id it holds.
+- Each commit takes the allocator's value once, after its writes applied, for the outbox commit (`{ seq, nextId,
+  writes }`) and the metadata row (mints meanwhile only raise it further); an export reads it once with `lastSeq`; the
+  archive manifest's `nextDocumentId` is `nextId`; import and batch apply restore it, so a replica mints above every id
+  it holds.
 
 ### 1.3 The commit step
 
@@ -93,13 +94,14 @@ Every item below changes 6a's code; nothing is deployed, so the schema and the a
   outcome: the store stops (`storage_failed`). The Cloudflare facade is checked to keep the same identity; a test
   injects failures at `BEGIN`, in the body, at `COMMIT` and at `ROLLBACK` on both drivers' facades.
 - **The refusal's error reaches the owner unchanged** (Durable's suite matches its messages); the store classifies it
-  for Chord's owners: an `int` `CHECK` failure (SQLite's extended code `SQLITE_CONSTRAINT_CHECK`) is `invalid/args` and
+  for Chord's owners: an `int` `CHECK` failure (SQLite's extended code `SQLITE_CONSTRAINT_CHECK` on Node; the error
+  message on the Durable Object facade, which has no extended codes) is `invalid/args` and
   fails only that transaction; every other refusal of a Chord commit (the engine's counted `UPDATE`/`DELETE`, the
   live-address index, a primary key, the saturated allocator, a backend error in a statement) fails the object live
   (`object_failed`, `broken`: memory and disk disagree).
 - **6a's owners:** a refused `self.tx` rejects with the error above and the object fails as above; a refused
-  migration commit (a chunk, (A) or (Z)) fails the activation `broken`, the table stays `migrating`, committed chunks
-  stay; a refused job start rejects the start; a refused outcome or finish commit fails the object (records and
+  migration commit (a chunk, (A) or (Z)) is rolled back whole, fails the activation `broken`, the table stays
+  `migrating`, earlier committed chunks stay; a refused job start rejects the start; a refused outcome or finish commit fails the object (records and
   memory disagree); a refused commit that carried held changes (D8) fails the object.
 - **Reads:** a read's callback returns data, never throws for a request: an adapter's request checks (an unknown
   conversation, a cursor, history a document does not keep) happen after the guarded read returned, from tagged
@@ -108,9 +110,9 @@ Every item below changes 6a's code; nothing is deployed, so the schema and the a
 
 ### 1.5 The documents engine
 
-- **Addresses:** `(owner, namespace, kind, key?)`: `owner` the claimed name; `namespace` the adapter's partition
-  (Chord: `chord` for documents, `chord.jobs` and `chord.job-states` for persisted runs; Durable: its scope,
-  `session`, `conversation:<id>`, `task:<id>`); `kind` and `key` as the adapter writes them (Durable JSON-encodes both,
+- **Addresses:** `(owner, namespace, kind, key?)`: `owner` the owner name; `namespace` the adapter's partition, claimed
+  with the owner (Chord: `chord` for documents, `chord.jobs` and `chord.job-states` for persisted runs; Durable: the
+  document's scope, `session`, `conversation:<id>`, `task:<id>`, which Durable's reads by scope need); `kind` and `key` as the adapter writes them (Durable JSON-encodes both,
   as its indexed strings). One live record per address (the partial unique index).
 - **`history` per record (R1):** `none` (Chord: older revisions dropped at a new base; row and revisions deleted at
   retirement), `latest` (Durable's session, task and latest conversation documents: older revisions dropped; the row
@@ -129,13 +131,15 @@ Every item below changes 6a's code; nothing is deployed, so the schema and the a
 ### 1.6 The archive and batch apply
 
 - **Format 1 gains** (nothing deployed): `document.create` carries `history`, `retiredAt?` and `meta`; a
-  `document.revision { id, seq, kind, version, content }` part per kept revision, in seq order after its create; for
-  `none` and `latest` records only the current base and its deltas are exported (as 6a), for `rewindable` every
-  revision, retired records included. Import checks: revisions in seq order, a base first, `seq <= lastSeq`, lifetimes
+  `document.revision { id, seq, content }` (`content` a `DocumentContent`: `{ kind: "base", version, value }` or `{ kind:
+  "delta", version, ops }`) part per kept revision, in seq order after its create; for
+  live `none` and `latest` records only the current base and its deltas are exported (as 6a); a retired `latest` record
+  is exported as its record alone (no base: its content was dropped at retirement); for `rewindable` every revision,
+  retired records included. Import checks: revisions in seq order, a base first, `seq <= lastSeq`, lifetimes
   at one address never overlapping (a second live record is still refused), versions per revision; the `end` count
   includes revisions.
-- **Batch apply** (`applyBatch(store, commits, ctx)`, internal): only on a store with no attached host (no owner's
-  memory to update); `commits[0].seq` follows `lastSeq` (S5); one backend transaction for the batch, every write applied
+- **Batch apply** (`applyBatch(store, commits, ctx)`, internal): refused while any owner holds a claim on the store
+  (an object or a `StoreStorage`: its memory would go stale) and run through the store's commit queue; `commits[0].seq` follows `lastSeq` (S5); one backend transaction for the batch, every write applied
   with its commit's seq, `lastSeq` and `nextId` set from the last commit; the applier handles every `StoreWrite` kind
   (`alter`, `dropIndex`, `update`/`updateWhere`/`delete`/`deleteWhere` with their recorded counts and versions,
   `document.change`, `document.retire`, `document.revision`), checked against the store's records (a trust boundary);
@@ -154,10 +158,11 @@ every commit, Durable's reopen harness), and Durable's Session and harness test 
 
 `StoreStorage.open(store, owner, ctx)`: claims `owner` (1.1); declares its tables through the store's table
 preparation (the path `self.table` takes: created at the newest version or migrated); raises the allocator to
-`max(record_ids.id) + 1` (one index read; covers stores built by import or batch apply); attaches to the store's host
+`max(record_ids.id) + 1`, saturating at `Number.MAX_SAFE_INTEGER` (one index read; covers stores built by import or
+batch apply); attaches to the store's host
 batch if there is one. Chord exports for it: `StoreOwnerTables` (declare and prepare tables under an owner),
 staged table writes and engine writes, the step reader, the read transaction, `mintId`, the commit with a fence. Its
-`close(context)` releases the claim and refuses every later call ("StoreStorage is closed"); the store stays open (the
+`close(context)` refuses new calls ("StoreStorage is closed"), waits for its calls underway, then releases its claims; the store stays open (the
 app owns it).
 
 ### 2.2 Tables
@@ -165,13 +170,16 @@ app owns it).
 Every row carries the record's indexed columns and the whole record as `json(unknown(), { version: 1 })`; indexed
 strings that must stay lossless (`kind`, `request_id`) hold Durable's JSON encoding; index columns are non-`opt`, so
 absent values take sentinels that no encoded value can be (`0` for an absent owner id, ids start at 2; `""` for an
-absent request id, JSON-encoded strings start with `"`).
+absent request id, JSON-encoded strings start with `"`). SQLite's partial head index is the table `entry_heads`
+(builder, 2026-10-27: an index on `(conversation_id, has_head, id)` cost about 5.5 µs per commit; the table is written
+only for entries with a head and is faster on both paths).
 
 | Table | Key | Columns | Indexes |
 | --- | --- | --- | --- |
 | `record_ids` | `id` | `record_type str` | |
 | `conversations` | `id` | `owner_conversation_id int`, `owner_task_id int`, `record` | `(owner_conversation_id, id)`, `(owner_task_id, id)` |
-| `entries` | `id` | `conversation_id int`, `has_head int` (0/1), `commit_seq int` (stamped), `record` | `(conversation_id, id)`, `(conversation_id, has_head, id)` |
+| `entries` | `id` | `conversation_id int`, `commit_seq int` (stamped), `record` | `(conversation_id, id)` |
+| `entry_heads` | `id` | `conversation_id int` (one row per entry with a `head`, written with it) | `(conversation_id, id)` |
 | `tasks` | `id` | `conversation_id int`, `kind str`, `status str`, `abort_requested int`, `background int`, `record` | `(status, id)`, `(conversation_id, id)`, `(kind, id)`, `(abort_requested, id)`, `(background, id)` |
 | `submissions` | `id` | `conversation_id int`, `request_id str`, `status str`, `record` | `(conversation_id, request_id)`, `(conversation_id, id)`, `(status, id)` |
 
@@ -183,8 +191,11 @@ adopt: (seq) => adopt(seq) }` (adopted in the host's batch, 1.3). Inside the ste
 another record type, a conversation, entry or document written twice: Durable's messages), the per-document actions
 of `prepareDocumentActions`/`checkDocumentActions` (one content command per document, a delta on its version, one live
 incarnation per address: "already has a current incarnation"), then the table `put`s (`record_ids` only for ids not yet
-claimed by the same type), then per document: its creation (explicit id) or content, then its retirement; a
-create-plus-retire is an empty lifetime (`createdAt = retiredAt = seq`). Copies (`document.copy`) are resolved before
+claimed by the same type), then the documents in two passes: first every document that already exists (its content,
+then its retirement), which frees the addresses a creation of this commit takes, then the creations and copies (each
+with its retirement, a create-plus-retire being an empty lifetime, `createdAt = retiredAt = seq`). Durable's
+"reconstructs rewindable documents" case (`create secondId` at address A, `retire firstId` at A, `change firstId`)
+needs this order. Copies (`document.copy`) are resolved before
 the step (S11): the source read at its point, checked against the copy's record ("changed in the copy batch",
 kind, key, history, fork), entered as a creation carrying the base. A refused check rejects with Durable's message (a
 refusal, 1.4): the store goes on, Durable's Session fails (`GuardedStorage`).
@@ -219,7 +230,8 @@ Durable from other objects is slice 8's (the harness in a registry entry, carry-
   the source in that batch; a call outside any batch (Durable's deferred commits, `#hold`, and the task graph's
   `blocked` refresh, even on the store; any Durable storage that is not the store) is queued and one batch on the next
   microtask applies everything queued. A derive over two views of one commit sees both changes in one computation.
-- **Ends (R4):** `failed` fails the object `transient` (its retry reopens Durable and attaches again); `ended` is final:
+- **Ends (R4):** `failed` fails the live object `transient` (reported once as `object_failed` with that failure, its
+  identity's backoff, several sources ending at once fail it once; its retry reopens Durable and attaches again); `ended` is final:
   a pending retirement call reaches the source's watches first (Durable's `endAfterDelivery`), then they end `ended`;
   the member keeps its last value; a new `watch` on an ended follow source opens at that value and ends `ended` at once.
 
@@ -258,16 +270,19 @@ rebuilt as the in-memory one.
 | `finish` fails | record `finishFailures + 1`; at 5 `blocked: "finish_failed"` | retried after the backoff, a blocked run on reload |
 | `finish` succeeds | record deleted, state retired (Q9), with what `finish` wrote | the run settles |
 | clean stop (host close, a native restart, R3's seal) | the stopped runs written `stopped`, held state flushed, by the close writer | |
-| activation (once per object, not per retry) | each `running` record: `restarts + 1` (or, at 5, `failed { restart_limit }` and `finishing`, `job_interrupted` reported); `stopped` and `pending`: back to `pending` | maps, keys, active count, `running` rebuilt before anything runs; `rerun` invokes, `abandon` records `failed { aborted, restart }`; an abort-marked run finishes `aborted` without `run`; `finishing` resumes `finish`; `blocked` stays |
+| activation (records loaded once per object; each live attempt resumes what waits) | each `running` record: `restarts + 1` (or, at 5, `failed { restart_limit }` and `finishing`, `job_interrupted` reported); `stopped` and `pending`: back to `pending` | maps, keys, active count, `running` rebuilt before anything runs; `rerun` invokes, `abandon` records `failed { aborted, restart }`; an abort-marked run finishes `aborted` without `run`; `finishing` resumes `finish`; `blocked` stays; a record of another job version, or of the same version with another fingerprint, is `blocked: "version"` |
 
+- **A retry after a seal (R3):** the runs the seal stopped are resumed by the next live attempt only once their old
+  invocation settled (bounded by `closeTimeout`, as the drain; an invocation outliving it is fenced, its run resumes
+  then), so a `run` that ignores its signal never runs twice at once.
 - **The close writer:** at the object's end, after the drain and before the documents drop, one commit past the seal
   (Durable's `writeAtClose`): the runs stopped by the end written `stopped`, held state flushed; a run whose `run`
   outlived the drain is fenced and written `stopped` too; blocked persisted runs keep their records (dropped only by
   `abort`). In-memory runs keep 6a's rules.
 - **Pinning:** records and state documents of unsettled runs stay in memory (never evicted): `ctx.state.value` and
   `running` read them synchronously.
-- **Fingerprint:** the job's fingerprint (args, result, state) is stored; a record of the job's version with another
-  fingerprint is `blocked: "version"` (resolved by slice 7).
+- **Fingerprint:** the job's fingerprint (args, result, state) is stored; a mismatch is `blocked: "version"` (resolved
+  by slice 7). A run ending at the limit reports `job_interrupted { object, job, id, restarts }` (a new `HostError`).
 
 ### 4.3 Deferred state (D8)
 
@@ -300,8 +315,9 @@ does nothing.
   joined and stored, abort racing an outcome, deferred state merged, flushed at the outcome and at close, pinned past
   the retention); GC (closed `StoreStorage`, ended follow sources, cancelled abort waiters, deferred timers, settled and
   dropped runs).
-- **Examples:** `26-durable-on-the-store.ts` (a worker with Durable's Session and a Chord store object on one store,
-  exporting the archive), `27-durable-views.ts`, `28-persisted-jobs.ts`.
+- **Examples:** Durable's `test/examples/35-durable-on-the-store.ts` (a worker with Durable's Session and a Chord store
+  object on one store, exporting the archive) and `36-durable-views.ts` (Chord's tests import nothing of Durable);
+  Chord's `28-persisted-jobs.ts`.
 
 ## Carry-over taken
 

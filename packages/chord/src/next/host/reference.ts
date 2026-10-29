@@ -123,7 +123,7 @@ type BindingState =
 			readonly dependent: ChordObject | undefined;
 			readonly target: Target;
 	  }
-	| { readonly kind: "refused"; readonly batch: Batch; readonly failure: Failed }
+	| { readonly kind: "refused"; readonly batch: Batch; readonly failure: Failed; readonly bind: () => void }
 	| { readonly kind: "released"; readonly state: Ended };
 
 /** What a wait for a state decides at each change. */
@@ -135,8 +135,6 @@ type Decision =
 const WAIT: Decision = { kind: "wait" };
 
 const DONE: Decision = { kind: "done" };
-
-const IGNORE = (): void => {};
 
 /** A wait for a state: checked at every change, rejected with the reference's end. */
 type Waiter = { readonly check: () => void; readonly end: (error: ChordError) => void };
@@ -240,11 +238,15 @@ export class Binding implements Holder {
 		this.moved();
 	}
 
-	/** A `host.hold` that cannot be bound once `load` resolved: failed with `cause`, which no retry changes. */
-	refuse(cause: FailureCause): void {
+	/**
+	 * A `host.hold` that cannot be bound (where it goes refused it): failed with `cause` until `ref.retry()` runs `bind`
+	 * again (a route's `authorize` may admit it later).
+	 */
+	refuse(cause: FailureCause, bind: () => void): void {
 		const state = this.#state;
 		if (state.kind !== "unbound") return;
-		this.#state = { kind: "refused", batch: state.batch, failure: { kind: "failed", cause, retryAt: undefined } };
+		const failure: Failed = { kind: "failed", cause, retryAt: undefined };
+		this.#state = { kind: "refused", batch: state.batch, failure, bind };
 		this.moved();
 	}
 
@@ -253,7 +255,7 @@ export class Binding implements Holder {
 	 * rejects them with the cause; waits for a state decide.
 	 */
 	moved(): void {
-		this.#refState?.changed();
+		this.#refState?.moved();
 		const state = this.refState;
 		if (state.kind === "live") {
 			this.#parked?.flush(
@@ -388,9 +390,17 @@ export class Binding implements Holder {
 		return this.#ended.promise;
 	}
 
-	/** `ref.retry()`: the object is asked for an attempt now; it ignores this unless failed. */
+	/** `ref.retry()`: the object is asked for an attempt now (ignored unless failed); a refused hold is bound again. */
 	retry(): void {
-		if (this.#state.kind === "bound") this.#state.target.retry();
+		const state = this.#state;
+		if (state.kind === "bound") {
+			state.target.retry();
+			return;
+		}
+		if (state.kind !== "refused") return;
+		this.#state = { kind: "unbound", batch: state.batch, dependent: undefined };
+		this.moved();
+		state.bind();
 	}
 
 	/** Releases the reference (idempotent); the object may end when it was its last. */
@@ -418,7 +428,7 @@ export class Binding implements Holder {
 		this.#parked?.reject(error);
 		this.#parked = undefined;
 		for (const watch of this.#watches) watch.end({ kind: "ended" });
-		this.#refState?.end(ended);
+		this.#refState?.released(ended);
 		// Each removes itself; promise reactions run later.
 		for (const waiter of this.#waiters) waiter.end(error);
 		this.#ended?.resolve();
@@ -483,13 +493,14 @@ export class Binding implements Holder {
 	#watchableState(): ReferenceState {
 		if (this.#refState !== undefined) return this.#refState;
 		const state = this.#state;
-		// A released reference's state never changes: its watches end at once, with no listener to report. Bound, not a
-		// closure: `read` would share the closure's scope and keep the batch after release.
-		const [report, assertOutside] =
-			state.kind === "released"
-				? [IGNORE, IGNORE]
-				: [state.batch.reportListener, state.batch.assertOutside.bind(state.batch, "watch")];
-		this.#refState = new ReferenceState(() => this.refState, report, assertOutside);
+		// A released reference's state never changes: it is made ended, keeping no batch.
+		if (state.kind === "released") {
+			const made = new ReferenceState(() => this.refState, undefined);
+			made.released(state.state);
+			this.#refState = made;
+			return made;
+		}
+		this.#refState = new ReferenceState(() => this.refState, state.batch);
 		return this.#refState;
 	}
 

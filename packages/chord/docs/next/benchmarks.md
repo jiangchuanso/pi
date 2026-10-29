@@ -490,3 +490,146 @@ Observations:
 - Late migration chunks cost what early ones do (paging forward by the last key keeps each chunk's read bounded); the
   spec's estimate of about 15 µs per migrated row holds with room.
 - A bulk write's step is the one place a single commit holds every owner's commits for milliseconds; the guide says so.
+
+## Slice 6b: Durable on the store, persisted jobs (2026-10-28)
+
+Node 24.4.1, one CPU (`taskset -c 6`), SQLite files in `tmpdir()`. HEAD is `b2fcfee08`, extracted at a path of the same
+length (`/home/badlogic/pi-6h`); runs alternate HEAD and the build.
+
+**Durable's storage benchmark** (`packages/durable/test/storage.bench.ts`, `TIMING_SCALE`), `StoreStorage` (outbox off)
+against `SqliteStorage` in the same process, mean ms per operation over three runs (p75 where the mean is one outlier):
+
+| Case | SqliteStorage | StoreStorage | |
+| --- | --- | --- | --- |
+| exact entry lookup | 0.0030 | 0.0030 | 0% |
+| entry page scan (100) | 0.0942 | 0.0940 | 0% |
+| filtered task scan (50) | 0.0206 (p75 0.0200) | 0.0220 (p75 0.0207) | +7% mean, +3% p75 |
+| exact document address among many | 0.0037 | 0.0037 | 0% |
+| document replay tail (0) | 0.0089 (p75 0.0084) | 0.0092 (p75 0.0085) | +3% mean, +1% p75 |
+| document replay tail (16 / 128 / 1024) | 0.0300 / 0.1726 / 1.224 | 0.0270 / 0.1522 / 1.135 | -10% / -12% / -7% |
+| ancient / recent historical read | 0.1681 / 0.1611 | 0.1541 / 0.1513 | -8% / -6% |
+| fork-depth history scan (100) | 0.1177 (p75 0.1156) | 0.1208 (p75 0.1159) | +3% mean, 0% p75 |
+| fork-depth head lookup | 0.0361 | 0.0332 | -8% |
+| commit one entry (20 samples) | 0.0439 (p75 0.0416) | 0.0601 (p75 0.0373) | +37% mean, -10% p75 |
+| commit 100 entries | 0.743 | 0.620 | -17% |
+| commit mixed entry/task/submission/document | 0.195 | 0.187 | -4% |
+| reopen and first exact read | 0.294 | 0.443 | +51% |
+
+Warm micro-benchmarks behind the same cases (each read 20,000 times; commits 10,000 after 2,000 warm-up): page scan
+91.2 vs 90.6 µs, task scan 19.9 vs 20.1 µs, fork-depth scan 114.1 vs 114.9 µs, head lookup 35.3 vs 32.9 µs, document
+address 3.57 vs 3.68 µs, replay tail (0) 8.41 vs 8.44 µs; one entry per commit 29.6 vs 27.8 µs mean, 18.4 vs 17.1 µs
+median. What it took, beyond the first build's compiled reads, point lookups without a bound `LIMIT`, version columns
+selected only past version 1 and the counting read guard:
+
+- **Reads select only the record.** A scan selected an entry's `commit_seq` too (only `entry(id)` needs it): 7% of a
+  page scan.
+- **No index for head markers on every entry.** `entries.by_head (conversation_id, has_head, id)` cost about 5.5 µs per
+  commit (a raw insert: 39.7 vs 45.2 µs); `SqliteStorage` has a partial index (`WHERE head IS NOT NULL`), which the
+  table vocabulary does not have. The head markers are an `entry_heads` table instead, written only with an entry that
+  has one: a commit without one writes no second index, and a head lookup reads the newest head's id, then the entry.
+- **A document record is one JSON text.** `meta` keeps the whole Durable record, its creation seq included; a read
+  selects `meta` (and `retired_at` only at a point).
+- **A store already at the newest schema opens with one read** (schema version, encoding and metadata row), without
+  the migrations' write transaction: 84 → 71 µs on a fresh connection.
+
+Commit one entry: the mean is one sample (Maglev compiling the commit path on the first fixtures: 130 and 386 µs at
+fixtures 25 and 30 of the first store round of a 60-fixture replay, none in the second round, no GC or deopt traced);
+the median and p75 are lower than `SqliteStorage`'s. Reopen: a fresh connection on a copied file, measured in parts
+(`openNodeSqliteDatabase` is the same for both): `SqliteStorage.open` 42-60 µs; `openStore` 63-71 µs (the schema read,
+the catalog with its JSON parse) plus `StoreStorage.open` 75 µs (declaring six tables: their SQL rendered, claims; the
+catalog check of the table preparation; `max(record_ids.id)` for the allocator, as §2.1 asks; compiling the point
+reads), first read +3 µs: about 0.1-0.15 ms once per open, cold code, not on any hot path.
+
+**Statements per commit** (cost guard in `packages/durable/test/store-storage.test.ts`): an entry append and a document
+delta take 4 each (`SqliteStorage`: 5 and about 7).
+
+**Memory** (`packages/durable/test/storage-memory.ts`): heap after seeding 0.16 → 0.30 MiB (1k), 0.17 → 0.32 MiB (10k):
+a fixed cost of the store (catalog, compiled statements, claims, the store's code), the same at both scales; heap after
+reads 0.13 → 0.16-0.18 MiB. Disk 0.61 → 0.58 MiB (1k), 4.34 → 4.38 MiB (10k).
+
+**Chord's commit gate** (`test/next/bench/store.ts`), HEAD → build, two alternating runs each, medians:
+
+| Case | HEAD | build |
+| --- | --- | --- |
+| (a) one document delta per commit | 13.6-13.7 µs | 13.8-14.0 µs (+2%) |
+| (b) one table put per commit | 12.8-13.3 µs | 13.0-13.2 µs |
+| (c) whole transactions (no watch / watched) | 17.2-17.3 / 17.1-17.2 µs | 17.4-17.7 / 17.2-17.7 µs (+2%) |
+| (d) one in-memory document (median / burst) | 2.1 / 2.9-3.0 µs | 2.1 / 4.9 µs |
+| heap after GC | 2940 KiB | 2996 KiB |
+
+The revisions index is a partial index on bases (`(document_id, seq) WHERE kind = 'base'`): a delta writes no index
+entry (the first build's `(document_id, kind, seq)` cost (a) 15%). (d)'s burst is not the in-memory path: run alone
+(only section (d), three alternating runs) HEAD gives 4.9-5.1 µs and the build 4.9-5.0 µs per commit, and 40 bursts of
+1,000 in a fresh process 2.17 vs 2.18-2.38 µs; in the full gate, HEAD's in-memory path runs warm from the persisted
+sections before it, the build's does not share as much of their code (`StoredChange`'s variants).
+
+**Durable's conversation view benchmark** (`test/conversation-view-bench.ts`, `PI_DURABLE_BENCH_STORAGE`), two runs
+each, `SqliteStorage` → `StoreStorage`: append one entry per commit 56.1-57.2 → 56.2-57.0 µs with one watch, 61.0-62.1
+→ 62.7-63.1 µs with four (+2%); bursts of 50 884-888 → 891 µs; `pi.live` only 62.7-63.0 → 65.1-66.6 µs (+4-6%); a
+long-lived watch over 20,000 appends 0.83-0.85 → 0.84-0.85 s CPU; heaps 21.5 → 21.7 MiB.
+
+**Fix round 1** (2026-10-28, after the build reviews): `StoreStorage`'s reads take one promise besides the store's guard
+(no `#call` wrapper; `close` waits for its commits, a read changes nothing), their request errors in a tagged result.
+Warm micro-benchmark (20,000 runs, two runs each, `SqliteStorage` → `StoreStorage`): filtered task scan 19.8 → 19.8-20.1
+µs, `entry(conversation, id)` over the fork chain 23.1 → 21.9-22.3 µs. `storage.bench.ts` (two runs): task scan mean
+0.0207 → 0.0217-0.0218 ms (p75 0.0200-0.0203 → 0.0204-0.0206), fork-depth scan 0.1177-0.1188 → 0.1210-0.1242 (p75
+0.1154-0.1167 → 0.1160-0.1193), the rest as above.
+`conversation-view-bench` "resume 20 back", three runs: CPU 4.23-4.47 → 4.50-5.14 ms for a 3 ms scenario (one sample
+each; the head lookup and scans under it are at parity or faster in the micro-benchmark). The persisted-job fixes
+(one invocation per call of `run`, held state folded in a `PendingOps`): start 55.5 → 55.2 µs, immediate state change
+21.3 → 21.2 µs, deferred 3.2 → 3.5 µs (the fold), in memory unchanged.
+
+**Persisted jobs** (`test/next/bench/jobs.ts`, 7 bursts of 500, medians): a start (resolved after its commit) 8.4 µs in
+memory, 55.5 µs persisted (two commits: the record and state created, then the reservation); a state change inside
+`run` 2.7 µs in memory, 21.3 µs persisted (one delta commit, as the gate's (c)), 3.2 µs deferred (stored with the
+outcome).
+
+## Slice 8: registries and `host.root` (2026-10-28)
+
+Node 24.4.1, one CPU (`taskset -c 6`), runs alternating. HEAD is `391e83fb1`, extracted at a path of the same length
+(`/home/badlogic/pi-h8`); the build was measured in the worktree and, where the worktree itself skewed a result (below),
+in an extract of the same sources at `/home/badlogic/pi-x8`.
+
+**Paths under every object** (`test/next/bench/calls.ts`, new: runs on HEAD as it is), median per operation over nine
+bursts, heap allocated per operation, three alternating runs each, HEAD → build:
+
+| Case | HEAD | build |
+| --- | --- | --- |
+| local method call (its ctx) | 2.80-2.81 µs, 6,894 B | 2.81-2.83 µs, 6,894 B |
+| commit through a watched derive (`batch.compute`) | 10.34-10.43 µs, 15,312 B | 10.46-10.51 µs, 15,310 B |
+| activation churn: get, live, release (an object with params) | 57.5-59.3 µs, 43,696-43,717 B | 58.1-58.9 µs, 43,782-43,787 B |
+| retained per live object (10,000 kept) | 6,586 B | 6,602 B |
+
+The attempt keeps its registry reads, contributions, wake signals and writables in one record made by the first such
+declaration, and iterates nothing when there is none: the first build allocated 1,020 B more per activation (six
+arrays per attempt, an array iterator per `for … of` over an empty list, a copy from `splice`) and retained 72 B more
+per live object; now +70 B allocated and +16 B retained (one field on the attempt, one on the object).
+
+**Existing benchmarks**, HEAD → build: the derive diamond (`derives.ts`, three runs) 9.4-9.8 → 9.5-9.9 µs median; its
+pooled p95 16.5-17.1 → 18.4-20.8 µs comes from the run in which V8 tiers the commit path up (per run, after it: HEAD
+10.7-11.3 µs, build 10.1-11.3 µs; the first measured runs 15.0-25.6 µs on either side, in another run each), the same
+with HEAD's `batch.ts` and `derive.ts` in the build. The store gate (`store.ts`, three runs): every median within
+0.4 µs (Chord store 13.0-13.9 → 13.0-14.2 µs, Chord host 17.3-18.2 → 17.3-17.8 µs, in-memory document 2.1 → 2.2 µs),
+heap 3,498 → 3,144 KiB. Jobs (`jobs.ts`): start 8.4 → 8.5 µs in memory, 55.4 → 56.2 µs persisted; state change 2.7 →
+2.7, 21.3 → 21.8, 3.4 → 3.5 µs. Links (`links.ts`, three runs): wire sizes, encodes, decodes and heap per message
+unchanged; its round trips are one cold burst each and vary as much between HEAD runs (commit to frame, text codec,
+0.055-0.076 ms). A warmed remote call (2,000 calls per burst, nine bursts, a memory link): binary 7.16-7.24 → 7.17-7.29
+µs, text 7.66-7.72 → 7.70-7.83 µs in the extracts; the worktree itself runs the same sources at 7.8-7.9 µs (binary),
+an effect of the tree, not the code.
+
+**Registries and writables** (`test/next/bench/registries.ts`, new), median over nine bursts: `writable.set` delivered
+to one watch 0.81-0.91 µs (2.9 KB allocated: the batch and the watch's call); a set of the same value 0.008 µs, 0 B
+(one comparison: its batch work is a method of its own, so `set` allocates no closure context); one of 10 contributions
+changed while the registry is watched 0.74-0.77 µs, of 100 1.52-1.59 µs (the table built again over every entry, one
+compose per set: the counted `chord.registry.composes` is 1.00 per set).
+
+**Fix round 1** (2026-10-28), HEAD extract → build extract (`/home/badlogic/pi-x8`), CPU 6. `calls.ts`, two runs: local
+method call 2.80 → 2.80-2.81 µs, 6,894 B both; commit through a watched derive 10.51-10.65 → 10.72 µs; activation churn
+57.9-59.0 → 59.3-60.0 µs, 43,714 → 43,769-43,787 B. The derive diamond (five runs): median 9.4-9.8 → 9.5 µs, pooled p95
+16.4-16.7 → 19.0-19.2 µs. Per run, both have one slow run while V8 tiers the commit path up (HEAD its second, median/p95
+15.5/22.6-22.9 µs; the build its first, 16.4/26.7-27.2 µs) and equal runs after it (HEAD 8.8-9.6/9.6-11.2 µs, build
+8.9-9.8/9.7-10.6 µs). `batch.compute` is not the cause: HEAD's `batch.ts` and `derive.ts` in the build give the same
+p95, and swapping host files moves it without a pattern (code layout, not work on the path). `registries.ts`:
+`writable.set` 0.87 µs, the same value 0.011-0.016 µs and 0 B (the seal check now comes first: a set of an ended
+attempt's writable throws whatever its value); one of 10 contributions set 0.71-0.78 µs, of 100 1.43-1.61 µs (one run
+in six 3.4 µs on either variant tried: JIT).

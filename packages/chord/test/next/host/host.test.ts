@@ -21,6 +21,7 @@ import { openNodeSqliteDatabase } from "../../../src/sqlite/node.ts";
 import {
 	failures,
 	fakeTimers,
+	faultyStore,
 	flushed,
 	forEachCodec,
 	linked,
@@ -693,6 +694,16 @@ describe("acquiring: hold and get", () => {
 		expect(await refused).toEqual(error);
 	});
 
+	it("invalid params before load resolved: hold throws and get rejects invalid/params at once (audit, 7a)", async () => {
+		const host = createHost(noErrors);
+		expect(() => host.hold(Page, { id: "x" } as never, context)).toThrow("params");
+		expect(await rejection(host.get(Page, { id: "x" } as never, context))).toMatchObject({
+			code: "invalid",
+			reason: "params",
+		});
+		await host.load([], context);
+	});
+
 	it("a hold released before load resolved makes nothing once it did", async () => {
 		const factory = vi.fn(({ id }: { id: number }) => ({ id: constant(id) }));
 		const host = createHost(noErrors);
@@ -804,10 +815,10 @@ forEachCodec(() => {
 		}
 
 		/** Sends a hold of `PlacedNotes` (or `type`) for `session`, naming `address` when given. */
-		function holdOf(peer: RawPeer, session: string, address?: string, type: string = PlacedNotes.name) {
+		function holdOf(peer: RawPeer, session: string, address?: string, type: string = PlacedNotes.name, hold = 0) {
 			peer.send({
 				kind: "hold",
-				hold: 0,
+				hold,
 				type,
 				version: PlacedNotes.version,
 				fingerprint: PlacedNotes.fingerprint,
@@ -835,9 +846,10 @@ forEachCodec(() => {
 				hold: 0,
 				cause: { kind: "broken", error: { kind: "chord", error: misplaced } },
 			});
-			holdOf(child, "S2");
+			// A refused hold is kept (a retry starts it again): the next hold takes the next id.
+			holdOf(child, "S2", undefined, PlacedNotes.name, 1);
 			expect(await child.next("failed")).toMatchObject({
-				hold: 0,
+				hold: 1,
 				cause: { kind: "broken", error: { kind: "chord", error: misplaced } },
 			});
 		});
@@ -921,20 +933,16 @@ describe("the host's store", () => {
 	});
 
 	it("reports storage_failed once and closes the host; the app still closes the store", async () => {
-		const store = await memoryStore();
+		const { store, fail } = await faultyStore();
 		const errors: HostError[] = [];
 		const host = createHost({ store, onError: (error) => errors.push(error) });
 		await host.load([], context);
-		const broken: StagedWrite = {
-			order: "write",
-			apply: async (step) => {
-				await step.run("INSERT INTO no_such_table VALUES (1)");
-				return { kind: "document.retire", id: 0, revision: 0 };
-			},
-		};
+		const write: StagedWrite = { order: "write", apply: async () => [] };
 		const fence = { admit: () => true, adopt: () => {} };
-		await expect(store.commit([broken], fence, context)).rejects.toMatchObject({ reason: "storage_failed" });
-		await expect(store.commit([broken], fence, context)).rejects.toMatchObject({ reason: "storage_failed" });
+		// A failed `COMMIT`: an unknown outcome (D4).
+		fail("COMMIT");
+		await expect(store.commit([write], fence, context)).rejects.toMatchObject({ reason: "storage_failed" });
+		await expect(store.commit([write], fence, context)).rejects.toMatchObject({ reason: "storage_failed" });
 		// The host closed itself; the app's own close returns that closing.
 		expect((host as ChordHost).closing).toBe(true);
 		await host.close(context);
