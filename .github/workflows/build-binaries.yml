@@ -1,9 +1,9 @@
 name: Build Binaries
 
+# Fork change: the `push: tags: ['v*']` trigger is removed so this upstream
+# pipeline no longer runs on tags. Installer releases are owned by
+# release-installers.yml. Keep this edit minimal to avoid merge conflicts.
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       tag:
