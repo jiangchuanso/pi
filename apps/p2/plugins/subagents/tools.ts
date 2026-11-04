@@ -5,6 +5,7 @@
 import type { AssistantMessage, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { Models } from "@earendil-works/pi-ai/models";
 import {
+	AgentDoc,
 	AssistantEntry,
 	type ConversationHandle,
 	type ConversationId,
@@ -27,9 +28,16 @@ import {
 import { arr, bool, compile, nul, obj, opt, str, union } from "@earendil-works/pi-schema";
 import type { Context, JsonValue } from "@p2/app/v1";
 import { type Location, type LocationInput, literal, locationText } from "@p2/app/v1";
-import { originOf } from "@p2/app/v1/worker";
+import { mainConversation, originOf } from "@p2/app/v1/worker";
 import { AGENT_MESSAGE_ENTRY, type AgentMessage, SUBAGENT_TASK_ENTRY, SubagentLocationsSchema } from "./contract.ts";
-import { HISTORY_TOOLS, resolveChoice, Subagents, TEAM_TOOL } from "./contract.worker.ts";
+import {
+	CODEMODE_TOOL,
+	HISTORY_TOOLS,
+	resolveChoice,
+	SUBAGENT_TOOLS,
+	Subagents,
+	TEAM_TOOL,
+} from "./contract.worker.ts";
 
 const SUBAGENT_EXTENSION = "subagent-tools";
 
@@ -129,11 +137,16 @@ async function latestAnswer(api: ToolExecutionApi, conversationId: ConversationI
 	}, context);
 }
 
-// Delivers one message, waits for the answer, then reports it to the main agent
+// Delivers one message, waits for the answer, then reports it to the conversation that sent the message
 // as a follow-up input. Request IDs make both submissions exactly-once across restarts.
 type ReporterInput = {
 	name: string;
 	conversationId: ConversationId;
+	/**
+	 * The conversation that sent the message, which the report goes to: a `/tree` branch left while the subagent works
+	 * still gets its answer. Absent (checkpointed before it was recorded): the current main conversation.
+	 */
+	parent?: ConversationId;
 	message: string;
 	followUp: boolean;
 	/** The owner started the main agent's turn: the subagent's turn inherits it (`SUBAGENT_TASK_ENTRY`). */
@@ -171,7 +184,7 @@ const Reporter = defineTask<ReporterInput, ReporterState, null>({
 					return next(settled.reason === "aborted" ? undefined : { intent: "failed", text: settled.reason });
 				// A continue settles like an input (it has no placed entry): its run's answer is reported the same way.
 				if (settled.type !== "input" && settled.type !== "continue") return next();
-				const agent = (await tx.doc(Subagents, runtime.conversationId)).agents[name];
+				const agent = (await tx.doc(Subagents, ROOT_CONVERSATION_ID)).agents[name];
 				if (!agent || agent.reported.includes(settled.answer)) return next();
 				agent.reported.push(settled.answer);
 				const answer = (await tx.entry(AssistantEntry, settled.answer))?.model?.[0] as AssistantMessage | undefined;
@@ -181,9 +194,9 @@ const Reporter = defineTask<ReporterInput, ReporterState, null>({
 		report: async (reporter, runtime, context) => {
 			const report = reporter.state.checkpoint.report;
 			if (report !== undefined) {
-				const { name, conversationId } = reporter.input;
-				const main = await runtime.conversation(runtime.conversationId, context);
-				await main?.submit(
+				const { name, conversationId, parent } = reporter.input;
+				const target = await runtime.conversation(parent ?? (await mainConversation(runtime, context)), context);
+				await target?.submit(
 					{
 						type: "input",
 						...(typeof report === "string"
@@ -357,9 +370,10 @@ export function createSubagentExtension(models: Models, locator: SubagentLocator
 			"  env is an environment name from location_envs, or null for this device (default: yours; another environment needs",
 			"  the owner's request).",
 			"  model is 'provider/modelId' (default: yours); thinkingLevel is off|minimal|low|medium|high|xhigh|max",
-			"  (clamped to the model); tools is a subset of read, write, edit, bash, send_file, artifact (default: all of these;",
-			"  [] for none) and the location tools location_envs, location_dirs, location_move (never by default; with",
-			"  location_move it can move itself).",
+			"  (clamped to the model); tools is a subset of read, write, edit, bash, send_file, artifact, codemode (default: all",
+			"  of these, codemode while code mode is on; [] for none) and the location tools location_envs, location_dirs,",
+			"  location_move (never by default; with location_move it can move itself). With codemode its scripts call its",
+			"  chosen tools and the tools behind code mode (MCP tools, terminal, one-shot agents).",
 			"- send (name, message; followUp: true queues after the current answer instead of steering).",
 			"- configure (name; optional model, thinkingLevel, tools, env, cwd, followSession): replace its model/thinking/tool",
 			"  selection for later work; env/cwd give it its own location, followSession: true makes it follow the session",
@@ -407,7 +421,10 @@ export function createSubagentExtension(models: Models, locator: SubagentLocator
 				details: { action, ...(name === undefined ? {} : { name }), ...extra } satisfies SubagentDetails,
 				isError,
 			});
-			const registry = (await api.snapshot(Subagents, api.conversationId, context)) ?? { agents: {}, reporters: {} };
+			const registry = (await api.snapshot(Subagents, ROOT_CONVERSATION_ID, context)) ?? {
+				agents: {},
+				reporters: {},
+			};
 			const installed = () => api.registry.tools().map((entry) => entry.tool);
 
 			if (action === "models") {
@@ -438,7 +455,7 @@ export function createSubagentExtension(models: Models, locator: SubagentLocator
 				return reply(`Stopped ${name}.`, { conversationId: agent.conversationId });
 			}
 			if ((action === "archive" || action === "restore") && agent) {
-				await setArchived(api, api.conversationId, agent.conversationId, action === "archive", context);
+				await setArchived(api, ROOT_CONVERSATION_ID, agent.conversationId, action === "archive", context);
 				return reply(action === "archive" ? `Stopped and archived ${name}.` : `Restored ${name}.`, {
 					conversationId: agent.conversationId,
 				});
@@ -480,7 +497,8 @@ export function createSubagentExtension(models: Models, locator: SubagentLocator
 			if (action === "spawn" || action === "configure") {
 				if (action === "spawn" && agent)
 					return reply(`${name} already exists${agent.archived ? " (archived)" : ""}; use send.`, {}, true);
-				const choice = await resolveChoice(models, api, args, action === "spawn" ? undefined : agent, context);
+				const existing = action === "spawn" ? undefined : agent;
+				const choice = await resolveChoice(models, api, args, existing, SUBAGENT_TOOLS, context);
 				if (typeof choice === "string") return reply(choice, {}, true);
 				change = { model: choice.model, thinkingLevel: choice.thinkingLevel };
 				tools = choice.tools;
@@ -506,7 +524,7 @@ export function createSubagentExtension(models: Models, locator: SubagentLocator
 			const session = location === null ? await locator.locate(ROOT_CONVERSATION_ID, api, context) : undefined;
 
 			const result = await api.commit(async (tx) => {
-				const state = await tx.doc(Subagents, api.conversationId);
+				const state = await tx.doc(Subagents, ROOT_CONVERSATION_ID);
 				const background = { ownership: { kind: "conversation" }, background: true } as const;
 				if (action === "configure") {
 					const target = state.agents[name];
@@ -551,6 +569,7 @@ export function createSubagentExtension(models: Models, locator: SubagentLocator
 				if (!target) return `No subagent named ${name}.`;
 				// Working with an archived subagent again brings it back.
 				delete target.archived;
+				target.parent = api.conversationId;
 				// Subagents spawned before the team or history tools existed get them now.
 				if (!target.team || !target.history) {
 					const all = installed();
@@ -562,6 +581,7 @@ export function createSubagentExtension(models: Models, locator: SubagentLocator
 				const input = {
 					name,
 					conversationId: target.conversationId,
+					parent: api.conversationId,
 					message: message ?? "",
 					followUp: action === "send" && followUp === true,
 					...(origin === "owner" ? { origin } : {}),
@@ -569,7 +589,7 @@ export function createSubagentExtension(models: Models, locator: SubagentLocator
 				state.reporters[api.taskId] = await tx.createTask(Reporter, input, background);
 				return action === "send" ? `Sent to ${name}.` : `Started ${name}.`;
 			}, context);
-			const current = (await api.snapshot(Subagents, api.conversationId, context))?.agents[name];
+			const current = (await api.snapshot(Subagents, ROOT_CONVERSATION_ID, context))?.agents[name];
 			return reply(
 				result,
 				current
@@ -590,11 +610,47 @@ export function createSubagentExtension(models: Models, locator: SubagentLocator
 
 /**
  * A subagent's tools plus the ones every subagent has: `team`, which is deferred (only conversations whose `modelTools`
- * adds it are offered it), and the history tools among `installed`.
+ * adds it are offered it), and the history tools among `installed`; with code mode also the tools behind it among
+ * `installed` (`scriptOnly`; the worker adds ones installed later, see `enableScriptTools`).
  */
 function withExtras(tools: readonly ToolRegistration[], installed: readonly ToolRegistration[]) {
 	const history = HISTORY_TOOLS.flatMap((name) => installed.filter((tool) => tool.name === name).slice(0, 1));
-	return { tools: [...tools, teamTool, ...history], modelTools: { add: [teamTool] } };
+	const behind = tools.some((tool) => tool.name === CODEMODE_TOOL) ? installed.filter(scriptOnly) : [];
+	return { tools: [...tools, teamTool, ...history, ...behind], modelTools: { add: [teamTool] } };
+}
+
+/**
+ * Whether only code mode scripts call `tool` (`callers: ["tools"]`: MCP tools, `terminal`, `agent`, code mode's own
+ * `models.*`). Durable enables exactly the tools a conversation's `tools` array names, and nested calls resolve among
+ * the enabled ones, so a subagent's array must name them for its scripts to reach them.
+ */
+export const scriptOnly = (tool: ToolRegistration): boolean => tool.callers?.includes("model") === false;
+
+/**
+ * Adds the tools behind code mode installed now (`names`) to every subagent with code mode, by name: MCP tools come and
+ * go with their servers, so the names written at spawn go stale. It runs between scripts, not inside one: a script's
+ * call resolves the agent once, at its start. A name whose tool goes away is ignored by Durable and works again when it
+ * returns, so none is removed.
+ */
+export async function enableScriptTools(
+	harness: Pick<Harness, "snapshot" | "commit">,
+	names: readonly string[],
+	context: Context,
+): Promise<void> {
+	const registry = await harness.snapshot(Subagents, ROOT_CONVERSATION_ID, context);
+	const lacking: ConversationId[] = [];
+	for (const agent of Object.values(registry?.agents ?? {})) {
+		if (!agent.tools.includes(CODEMODE_TOOL)) continue;
+		const enabled = (await harness.snapshot(AgentDoc, agent.conversationId, context))?.tools;
+		if (Array.isArray(enabled) && names.some((name) => !enabled.includes(name))) lacking.push(agent.conversationId);
+	}
+	if (lacking.length === 0) return;
+	await harness.commit(async (tx) => {
+		for (const conversationId of lacking) {
+			const state = await tx.doc(AgentDoc, conversationId);
+			if (Array.isArray(state.tools)) state.tools = [...new Set([...state.tools, ...names])];
+		}
+	}, context);
 }
 
 /**
@@ -656,7 +712,11 @@ const teamTool: ToolRegistration = defineTool({
 		if (!args.message?.trim()) return reply("send needs a message.", true);
 		const sibling = args.to === "parent" ? undefined : siblings.find(([name]) => name === args.to)?.[1];
 		if (args.to !== "parent" && !sibling) return reply(`No other subagent named ${args.to}.`, true);
-		const target = await api.conversation(sibling?.conversationId ?? ROOT_CONVERSATION_ID, context);
+		const parent = registry?.agents[self]?.parent;
+		const target = await api.conversation(
+			sibling?.conversationId ?? parent ?? (await mainConversation(api, context)),
+			context,
+		);
 		if (!target) return reply(`${args.to} has no conversation.`, true);
 		await target.submit(
 			{

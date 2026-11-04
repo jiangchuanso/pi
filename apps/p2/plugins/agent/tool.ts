@@ -11,12 +11,14 @@ import {
 	defineDoc,
 	defineExtension,
 	defineTool,
+	ROOT_CONVERSATION_ID,
 } from "@earendil-works/pi-durable";
 import { arr, compile, obj, opt, str, unknown, type Validator } from "@earendil-works/pi-schema";
 import { formats } from "@earendil-works/pi-schema/formats";
 import type { JsonValue } from "@p2/app/v1";
 import { record } from "@p2/app/v1";
-import { resolveChoice, Subagents } from "../subagents/contract.worker.ts";
+import { isTopLevel } from "@p2/app/v1/worker";
+import { ONE_SHOT_TOOLS, resolveChoice, Subagents } from "../subagents/contract.worker.ts";
 
 export const AGENT_TOOL = "agent";
 const ATTEMPTS = 3;
@@ -70,10 +72,17 @@ export function createAgentExtension(models: Models) {
 			}
 			// A rerun reattaches to the conversation it created, even if its model has since left the configuration.
 			const existing = (await api.snapshot(AgentRun, api.taskId, context))?.conversationId;
-			const choice = existing === undefined ? await resolveChoice(models, api, args, undefined, context) : undefined;
+			const choice =
+				existing === undefined
+					? await resolveChoice(models, api, args, undefined, ONE_SHOT_TOOLS, context)
+					: undefined;
 			if (typeof choice === "string") return fail(choice);
 			// Owned by this call: aborting the call aborts the agent's work. Listed in the same commit, by the call ID the
 			// script's tool card shows it under, so the user can open its transcript.
+			// The main conversation's and its `/tree` branches' one-shot agents are listed in the session's registry.
+			const listedOn = (await isTopLevel(api, api.conversationId, context))
+				? ROOT_CONVERSATION_ID
+				: api.conversationId;
 			const conversationId = await api.commit(async (tx) => {
 				const run = await tx.doc(AgentRun, api.taskId);
 				if (run.conversationId === undefined) {
@@ -90,7 +99,7 @@ export function createAgentExtension(models: Models) {
 						instructions: `You are a one-shot subagent working for a script. Do the requested work. Your final answer is parsed by the script: it must be only a JSON value matching this JSON Schema, without prose or code fences:\n${JSON.stringify(args.schema)}`,
 					});
 					run.conversationId = child.id;
-					const registry = await tx.doc(Subagents, api.conversationId);
+					const registry = await tx.doc(Subagents, listedOn);
 					registry.oneShots ??= {};
 					registry.oneShots[api.callId] = {
 						conversationId: child.id,
