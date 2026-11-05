@@ -47,12 +47,11 @@ P2_FAKE=1 npm start          # http://127.0.0.1:8788, data in ~/.pi/p2
   immediately. At most two previous generations remain available for up to 60 seconds. This polling is temporary
   until loader model D provides scoped, per-facet `ClientBundle` pushes (`docs/plugin-loading.md` 5.3 and 12.2 step
   4). The TUI launcher separately polls `/__p2_tui`. There is no Vite, source-module server or `index.html`.
-- **Bundles for Radius Cloud Brain:** the public repo `earendil-works/bundled-ui` holds prebuilt copies of this web
-  bundle, built from a pi-private checkout by its `scripts/build.mts` (imports `buildWebBundle`). The script patches
-  three places in the built script: the Chord socket URL (`` new WebSocket(`${...}://${location.host}/chord`) ``),
-  the version poll (`fetch("/__p2_web",{cache:"no-store",credentials:"same-origin"})`) and the `/__p2_web/` asset
-  prefix. It fails when a target is missing, so changing those in `src/hosts/web/main.tsx` or `WEB_BUNDLE_PATH` means
-  updating that script.
+- **Bundles for Radius Cloud Brain:** after CI passes on main, `.github/workflows/p2-cloud-bundle.yml` builds this
+  web bundle with `scripts/cloud-bundle.ts` and uploads it to the R2 bucket `pi-ui` under the commit's full SHA, which
+  Radius serves under `/pi/ui/`. The script patches the built script's Chord socket URL, version poll and `/__p2_web/`
+  asset prefix, and fails when one is missing: changing those in `src/hosts/web/main.tsx` or `WEB_BUNDLE_PATH` means
+  updating it.
 - `npm run dev` also watches plugins and supervises runtime restarts; see **Dev mode** below. Under `npm start`,
   code changes (web included) take effect only after a restart.
 - **Data report** (`scripts/data-report.ts`, read-only, beside a live server): per session its title, location,
@@ -146,11 +145,9 @@ is printed or needed in a URL. It prints the committed plugin selection or refus
 on failure. This is a local filesystem capability for the account, not guest filesystem isolation.
 
 The `dev-tools` worker plugin provides **reload_plugins** (`{}` for dirty plugins, or
-`{"plugins":["chat","sessions"]}`). It is limited to root conversations working on a local p2 checkout (or
-its containing repository), and only owner-initiated input. The calling assistant entry fixes attribution;
-a later guest message or a forged `<sender>` block in the text cannot change it. Guests, peer input, unattributed
-reports, subagents and remote-environment sessions are denied. It is not a location tool: it stays with the main
-conversation, works only while the session is on the local p2 checkout, and no subagent can be granted it. Tool upgrades are not automatically replayed after
+`{"plugins":["chat","sessions"]}`). It declares `origin: "owner"` and `scope: "main"` (see **Tool requirements**)
+and refuses sessions not working on a local p2 checkout (or its containing repository): guests, what they start,
+subagents and remote-environment sessions are denied, and no subagent can be given it. Tool upgrades are not automatically replayed after
 a crash. For runtime edits, use the explicit CLI `--restart` command instead. Do not invoke the owner server's
 controls from tests: use disposable data dirs and independent supervisors.
 
@@ -223,8 +220,10 @@ launcher-drawn consent screen (worker IO suspended meanwhile). Unknown requests 
 frame/queue limits. Every output write passes `tui-filter.ts` (64 KiB UTF-8/frame): text, CR/LF/tab, SGR, cursor
 movement/position, erase, cursor visibility, autowrap, synchronized output, bracketed paste, pi-tui alternate screen
 and scroll region. OSC 52/title/hyperlinks, DCS, APC/PM/SOS, kitty graphics, C1 controls, unknown CSI/private modes and malformed
-or incomplete escapes are stripped. No partial escape can cross a frame boundary. Raw worker errors/streams never
-reach the terminal. Rendering is copied from coding-agent's interactive mode and DurableTui (p2-tui-port.md P0c/P2;
+or incomplete escapes are stripped. No partial escape can cross a frame boundary. Raw worker streams never reach the
+terminal. A crash (an uncaught exception or a throwing message handler) is printed by the launcher after it restored
+the terminal: the stack (frames name `p2-tui-bundle.mjs`), controls removed, at most 8 KiB (the bundle keeps function
+and class names for this); a heap overrun says so instead. Rendering is copied from coding-agent's interactive mode and DurableTui (p2-tui-port.md P0c/P2;
 p2 imports neither coding-agent nor mobile): a fullscreen layout (transcript `ScrollView` over a dock of status lines,
 pending area, pi's editor with the working indicator in its border, and pi's footer), incremental transcript
 components keyed by the shared display items (`src/tui/components/`), pi's tool cards and renderers for bash, read,
@@ -342,6 +341,11 @@ p2 runs on Chord v2 (`packages/chord`, `docs/design.md` there); the port's notes
   where it lives with `hostAddress` (`serverHost`, `sessionHost`); a worker serves only its own session, so factories
   no longer compare `host.name`. The session workers are Chord's `createWorkers` (`src/hosts/session-workers.ts`:
   generations, logs and notices, relocation and pauses on `stop`/`retry`).
+- **Worker base:** session workers fork from Chord's worker base of `src/hosts/worker.ts` (split at dynamic imports).
+  The entry imports only the worker's side (`@earendil-works/chord/workers/child`, `src/hosts/host-packages.ts`), so a
+  fork loads no esbuild and no server API; pi-ai's provider SDKs load with their first request. It registers pi-ai's
+  lazy OAuth flows and Bedrock (`registerLazyOAuthFlows`, `registerLazyBedrockProvider`): chunks of the snapshot, not
+  pi-ai's source files (`test/p2/worker-base.test.ts`, `worker-oauth.test.ts`).
 - **Worker failures:** a failed start stays failed (status error, Retry) and its holders wait (`failed { waiting }`,
   `whenLive` does not reject: tests use `failureOf`). A running worker that crashes is restarted for its holders, at
   most five times a minute per session; the next crash waits for Retry. A worker stays alive while objects
@@ -578,9 +582,8 @@ translated phone drawer and intercept chat taps.
   not hold the Harness (a prompt section, a tool). Resolve at each use; a relocation changes the session's location.
 - **Location tools** (`plugins/locations`): `location_envs` (this device and the configured SSH environments: name,
   host, last test; never keys), `location_dirs` (`[env:]path` or `env`+`cwd`, at most 200 folders) and `location_move`.
-  Every main agent has them; a subagent only when its main agent chooses them (`subagent spawn/configure tools`; not
-  in the default selection). All require a turn the owner started (`originOf`; a main agent's message to its subagent
-  carries the main turn's attribution as a `p2.subagent-task` entry), and the server side (`AgentLocations`) admits
+  Every main agent has them, and so do the subagents and one-shot agents it gives them to (by default it gives all
+  its tools). All declare `origin: "owner"` (see **Tool requirements**), and the server side (`AgentLocations`) admits
   only current worker generations. The main agent's move is deferred: it records `p2.location-move` on the main
   conversation; the worker applies it through `SessionMoves` (the owner's Relocate) once Durable has no task or
   submission (the turn ended, no subagent work), retries a busy refusal after the next commit, records a destination
@@ -678,9 +681,11 @@ translated phone drawer and intercept chat taps.
   and the TUI's `watch` go where the contract places the input. `WorkerBoundary`, `SessionTransfer`
   and `PluginRemoval` (version 2) take a `session` input for that. Moving a type is a contract break.
 - **Authors** are assigned by the worker from the principal and stored in the input's entry data (`p2.input`,
-  `src/runtime/input.ts`); a peer session's message is a `p2.peer-message` entry (`src/runtime/entries.ts`). The
-  model message of both starts with a `<sender kind="owner|guest|session" …/>` block (`src/runtime/sender.ts`,
-  values escaped), which the preamble explains and nothing reads back: readers and `originOf` use the entry data.
+  `src/runtime/input.ts`); a peer session's message is a `p2.peer-message` entry, a subagent's report or `team`
+  message a `p2.agent-message` entry (`src/runtime/entries.ts`). Their model message starts with a
+  `<sender kind="owner|guest|session|subagent" …/>` block (`src/runtime/sender.ts`, values escaped; a subagent's
+  text follows as `[<intent>] <text>`), which the preamble explains and nothing reads back: readers and `originOf`
+  use the entry data.
   Stop/dequeue restore text only to its author; removing a queued input (×,
   no restore) discards it, as in Pi Mobile.
 - **Windowed conversation view** (`plugins/chat/worker.ts`, `src/web/history.ts`, `src/runtime/conversation-stats.ts`):
@@ -755,7 +760,25 @@ translated phone drawer and intercept chat taps.
   a send failing six times while connected put the text, attachments and reply target back into the composer with
   the error; Stop takes back what was not sent yet. The outbox lives for the page: leaving with unsent messages asks
   first. Who the page is (`useOwner`, a guest's grant) is kept while reconnecting, so the composer never turns into
-  the "Connecting…" bar after a drop; only a page that never connected shows it.
+  the "Connecting…" bar after a drop; only a page that never connected shows it. A message sent before the
+  conversation has loaded shows alone until it does. A message whose send started while no run was busy stays a
+  message until its entry shows: the run it starts lists it as queued for a moment, and the server's state can arrive
+  before the send's answer, so it would otherwise flash as a queued row above the composer and move it.
+- **A new session's first message** (`plugins/chat/session-start.ts`) does not wait either: Send on the new-session
+  screen clears the composer and shows the message there at once, online or not, above the session's (empty) context
+  bar, so the composer stays in place when the session opens; it is the same composer (see **Chat frame**), so it
+  keeps its focus and a phone's keyboard. The session is created (with the location and model chosen at that Send) whenever the owner's catalog is live, its messages move to the main
+  conversation's outbox, which delivers them, and the page opens the session. Messages sent meanwhile join the same
+  session. A creation the server refuses (its own errors: a missing directory, an unknown model) puts the messages
+  back into the composer with the error; a connection failure is retried like an outbox send. A creation whose answer
+  was lost with the connection can leave an empty session behind (`create` takes no request ID).
+- **Chat frame** (`Main` in `plugins/chat/web.tsx`): the chat's `.chat` area and its dock outlive the screens shown in
+  it (the new-session screen, a conversation, the next one). There is one composer, in the dock: a screen publishes
+  what the dock shows (`useChatScreen`: a bar above, the composer's settings, queued rows, the footer, or a bar in the
+  composer's place) after each of its renders, and renders its transcript into the frame's `.chat-view` (a
+  `display: contents` element) through a portal. Changing screens never replaces the composer's textarea, so it keeps
+  its focus and a phone's keyboard. Slots wrapping a screen start with the plugin registry's known table
+  (`knownRegistry`), so a screen mounts once, not again when its wrappers arrive a render later.
 - **Virtual transcript** (`src/web/use-chat-scroll.ts`, `virtual-list.ts`, `row-estimate.ts`, `scroll-gesture.ts`;
   after TanStack Virtual and react-virtuoso, without depending on either): the web transcript renders only the rows
   near the viewport (one viewport of overscan each way, everything up to the first row near the list's start) between
@@ -1021,16 +1044,17 @@ translated phone drawer and intercept chat taps.
   arguments. Tests: `artifacts.test.ts` (details, bridge), `ui-inline-artifacts.test.ts` (browser: Markdown, SVG,
   fills the width, fitted height, 70vh cap, card opens the viewer, unavailable version, guest), `tui-p11.test.ts`
   (inline Markdown).
-- **Conversations** (`plugins/conversations`): the root-only `conversations` tool lists active roots without
-  starting workers, sends server-attributed peer input, and reads the latest completed text answer (bounded scan,
-  no thinking, including old history). The tool fixes owner/peer origin at its calling assistant entry: later guest
-  input cannot change that grant, and unattributed reports do not inherit older owner access. `Conversations`
+- **Conversations** (`plugins/conversations`): the `conversations` tool (`origin: "owner"`, `scope: "main"`) lists
+  active roots without starting workers, sends server-attributed peer input, and reads the latest completed text answer
+  (bounded scan, no thinking, including old history). A send carries the sending turn's origin to the recipient's
+  `p2.peer-message` entry (`Conversations.query` and `PeerConversation.send` `origin`), so the recipient's turn may
+  act for the owner when the owner started the sender's. `Conversations`
   accepts only current worker generations; `PeerConversation` accepts only the parent's `{ kind: "server" }`
   principal. The server brokers the sender's ID/title from the catalog, checks archive around startup/admission
   and receipts, and scopes deduplication to sender + Durable tool task/call. Calls are short and cancellable;
   cancellation after admission does not undo remote work. Final answers never auto-forward. Owner peer labels
   navigate to roots (restoring archives); guests get plain labels. `test/p2/conversations.test.ts` covers list/send/
-  answer, authenticated peer replies, restart deduplication, concurrent cross-sends, busy answers, follow-ups,
+  answer, peer replies from the owner's turns, restart deduplication, concurrent cross-sends, busy answers, follow-ups,
   invalid destinations, reload, guest/forged attribution, child tool exclusion and inaccessible public ingress.
 - **Subagents** (`plugins/subagents`): owns its protocol-independent Durable extension (persistent
   anchor conversations and exactly-once background reporter tasks, model/thinking/tool validation). The worker
@@ -1040,22 +1064,40 @@ translated phone drawer and intercept chat taps.
   the list does not start/hold a worker. The sidebar expands children (latest entry first), with working dots;
   `/s/<id>/c/<conversation>` opens an independent chat, draft and model control. A parent link returns to the root.
   Browser configuration synchronizes the subagent registry via `ConversationConfigured`. Main Stop leaves child
-  work running; direct child prompts do not report to the parent. **Tools** (`SUBAGENT_TOOLS` in `contract.worker.ts`,
-  validated by `resolveChoice` before any commit): `tools` may name the coding tools, `codemode` and the location tools;
-  the default is the coding tools and `codemode`, as the main agent has code mode while the `codemode` setting is on
-  (the default leaves out what is not installed: code mode while the setting is off or without the plugin; naming an
-  uninstalled tool is refused, "Not available in this session: codemode."). `team` and the history tools come on
-  top. Durable enables exactly the names in a conversation's `tools` array, and code mode's nested calls resolve among
-  the enabled tools, so a subagent with code mode also gets the script-only tools (`callers: ["tools"]`: MCP tools,
-  `terminal`, `agent`, code mode's `models.*`) by name: at spawn/configure those installed then (`withExtras`), and
-  later ones (an MCP server connecting) from the worker, which follows the registry's script-only tools and appends
-  missing names to every code mode subagent's array (`enableScriptTools`; a tool task resolves its agent once per
-  phase, so this cannot happen inside the script's own call). Names are never removed: Durable ignores a name whose
-  tool is gone. A subagent's scripts can thus start one-shot agents (which get no code mode). `test/p2/subagents.test.ts`
-  covers bad models, configured spawn, one report, answer retrieval, configuration, independent history, reload during
-  child work, idle restart, guest reads, sidebar persistence across server restart, and code mode: choosing and
-  validating it, the default with the setting on and off, a script calling a coding tool and `agent`, and MCP tools
-  installed after the spawn; `terminal-tool.test.ts` a subagent's script opening a window at its own location.
+  work running; direct child prompts do not report to the parent. **Tools** (`resolveChoice`/`resolveTools` in
+  `contract.worker.ts`, validated before any commit, shared with one-shot agents): an agent gives from its own tools
+  (`api.agent()`: offered, deferred and script-callable), never more. It may give every tool its model calls except
+  `scope: "main"` ones (`subagent`, `rename_session`, `conversations`, `ports`, `reload_plugins`) and
+  `scope: "subagent"` ones (`team`, which every subagent gets, offered from the start); `tools` names them in order,
+  the default is all of them (code mode only while the main agent has it; naming a tool it lacks is refused with the
+  list it may give). Deferred tools stay deferred unless named (then offered from the start). Durable enables exactly
+  the names in a conversation's `tools` array, and code mode's nested calls resolve among the enabled tools, so an
+  agent given `codemode` also gets the caller's script-only tools (`callers: ["tools"]`: MCP tools, `terminal`,
+  `agent`, code mode's `models.*`) by name: at spawn/configure those installed then, and later ones (an MCP server
+  connecting) from the worker, which follows the registry's script-only tools and appends missing names to every code
+  mode subagent's array (`enableScriptTools`; a tool task resolves its agent once per phase, so this cannot happen
+  inside the script's own call). Names are never removed by the worker: Durable ignores a name whose tool is gone. A
+  `send` takes away what the caller can no longer give (its tools changed). The registry records the chosen names
+  (`ConversationConfigured` records the agent's choosable tools after a browser change). Requirements are looked up
+  by name in the worker's `Extensions` (`toolsByName`). `test/p2/subagents.test.ts` covers bad models, configured
+  spawn, one report, answer retrieval, configuration, independent history, reload during child work, idle restart,
+  guest reads, sidebar persistence across server restart, and tools: validation against the caller's tools, the
+  default with code mode on and off, a script calling a coding tool, `agent` (also with code mode) and MCP tools
+  installed after the spawn; `tool-access.test.ts` the resolution rules; `terminal-tool.test.ts` a subagent's script
+  opening a window at its own location.
+- **Tool requirements** (`src/runtime/tool-access.ts`): a plugin declares them on its tool (`P2Tool`, `defineP2Tool`):
+  `origin` (`"any"` default, or `"owner"`: only a turn the owner started) and `scope` (`"any"` default, `"main"`: only
+  top-level conversations, or `"subagent"`: given to subagents only). The worker's Durable registry wraps every tool
+  with requirements (`guardTool`, in `durableRegistry`), so no tool checks them itself. `origin: "owner"`: the location
+  tools, `reload_plugins`, `conversations`, `ports`, MCP tools (the owner's accounts are behind them). A turn's origin
+  (`originOf`, `src/runtime/origin.ts`) is the conversation's current run (`pi.live.run.inputs`, each submission's
+  entry through `tx.submission`): the owner's only if every input the run placed is (`entryOrigin`): a person's input
+  by its author in the entry data, an agent-written one by its `origin`. Agent-written inputs record the writing
+  turn's origin: subagent tasks and one-shot agents' prompts (`p2.subagent-task`), `team` messages and reports
+  (`p2.agent-message`; a report has the origin of the subagent's run that answered, `answerOrigin`: its inputs after
+  the previous run's final answer, `stop` or `length`, past mid-run error answers and compaction markers), and peer messages (`p2.peer-message`). A guest's input steered into a run takes the
+  owner's tools away for the rest of it; a guest-started chain never reaches them. Known gap: inputs of earlier runs
+  still in the context are not considered. `test/p2/inputs.test.ts`, `dev-tools.test.ts`, `tool-access.test.ts`.
 - **Code mode** (`plugins/codemode`): the worker facet registers Durable's `codemode` extension
   (`createCodemodeExtension`, tool `codemode`, callers `["model"]`, replay-safe) in `Extensions`. One sandbox per worker
   (`CodemodeSandbox`, 256 MiB VM heap: `CODEMODE_MEMORY_LIMIT_BYTES`, kept constant because it is part of the VM
@@ -1137,8 +1179,9 @@ translated phone drawer and intercept chat taps.
   `structuredOutput` is the value, `details` `{ conversationId, attempts }`; nothing is reported to the parent. It has no
   prompt section (as Pi Mobile 1b763d912): its description, Pi Mobile's verbatim, carries the usage notes, and code
   mode's section lists it with the other tools scripts call. Model/thinking/tool
-  validation is the subagent tool's `resolveChoice` with `ONE_SHOT_TOOLS`: the coding and location tools, never
-  `codemode` (a one-shot agent's own scripts could start one-shot agents again, fanning out without bound). The plugin contributes the tool unconditionally and does not
+  validation is the subagent tool's `resolveChoice` (one-shot agents get no `team`): from the script's conversation's
+  tools, `codemode` and `agent` included, so a one-shot agent's scripts may start one-shot agents again (owner
+  decision: no depth limit). Its prompts are `p2.subagent-task` entries with the script's turn's origin. The plugin contributes the tool unconditionally and does not
   depend on code mode: without a script nothing can call it (`callers: ["tools"]`), so code mode stays removable while
   it is loaded (code mode's listing then disappears; `agent.test.ts` removes and re-adds code mode). It depends on subagents,
   whose document lists its conversations. The creating commit
