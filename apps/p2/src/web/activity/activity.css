@@ -30,7 +30,8 @@
 	align-items: center;
 	align-self: stretch;
 	gap: var(--semantic-dimension-space-gap-small);
-	min-block-size: 3.5rem;
+	/* One --row, as a thought's row: the working wheel turning into a thought (or back) never changes the height. */
+	block-size: var(--row);
 	margin-inline: calc(-1 * var(--semantic-dimension-space-padding-medium));
 	padding-inline: var(--semantic-dimension-space-padding-medium);
 	border-radius: var(--semantic-dimension-radius-large);
@@ -50,10 +51,6 @@
 /* Done: no background, the words in the secondary colour (the counts of changed lines keep theirs). */
 .activity[data-state="done"] {
 	color: var(--semantic-color-text-secondary);
-}
-/* A turn's row stands apart from the message above it. */
-.activity-turn {
-	margin-block-start: var(--semantic-dimension-space-gap-small);
 }
 /* How long the turn took: counting while it works. */
 .activity-time {
@@ -194,10 +191,28 @@
 }
 .activity-ticker {
 	flex: 1;
+	align-self: stretch;
 	min-inline-size: 0;
+	/* The row's height, not Elanor's three faces: one face shows, the others roll through it. */
+	min-block-size: 0;
+}
+/* Only the face in front: the ones before and after fade out within the row instead of showing as cut slivers. */
+.activity-ticker .el-ticker-drum {
+	-webkit-mask-image: linear-gradient(
+		transparent 8px,
+		#000 14px,
+		#000 calc(100% - 14px),
+		transparent calc(100% - 8px)
+	);
+	mask-image: linear-gradient(transparent 8px, #000 14px, #000 calc(100% - 14px), transparent calc(100% - 8px));
 }
 .activity[data-state="done"] .activity-ticker {
 	color: var(--semantic-color-text-secondary);
+}
+
+/* Wider than a settings sheet on large screens: a call's input and output are code, read best unwrapped. */
+.sheet.activity-sheet {
+	max-width: 720px;
 }
 
 /* The sheet's first page: the run's calls, one 44px row each, separated by thin lines; the body's padding is the
@@ -270,4 +285,17 @@
 	flex-direction: column;
 	gap: var(--s4);
 	min-width: 0;
+}
+
+/* Thinking and a text in a wheel's list (detail 1 and 2): their words, not code. */
+.step-list [data-kind] .step-argument {
+	font-family: inherit;
+	font-size: inherit;
+}
+/* At detail 4 (settings.json) a run's calls are rows in the transcript, at the text's edges, between two lines. */
+.activity-rows .step-list {
+	border-block: 1px solid var(--line);
+}
+.activity-rows .step-row {
+	padding-inline: 0;
 }
