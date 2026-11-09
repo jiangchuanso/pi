@@ -1022,7 +1022,8 @@ translated phone drawer and intercept chat taps.
   editors persist in localStorage per conversation; Send/Send all use ordinary attributed Chat input. Integration
   tests cover fake-provider prompts, a temp git repo, bounds, reload/watch lifetime, HTTP streaming/ranges, upload
   cleanup/concurrency and guest revocation; `ui-workspace.test.ts` the browser panel. The web panel docks at 1200 px,
-  remembers its resizable list width, and shows a file beside the list when both chat and file can retain 480 px.
+  remembers its resizable list width (dragged at its left edge from 900 px, as an overlay too), and shows a file beside
+  the list when both chat and file can retain 480 px.
   Read/write/edit cards supply one-step Open in workspace links. Files/commits push; views/search replace; tabs reset
   the trailing workspace run. List/file scroll positions survive Back and reload.
 - **Remote environments** (`plugins/envs`, [guide](remote-envs.md)): owner-only `Envs` lists environments with their
@@ -1196,8 +1197,10 @@ translated phone drawer and intercept chat taps.
   representation as GET. The chat-content slot supplies the shared transcript card contexts and explicit-click
   file/artifact viewers; a top-bar counter toggles a list of every version, newest first, in the side panel
   (`SidePanel`, `Route.panel` "artifacts": docked on the right from 700px like a run's activity, which it replaces and
-  which replaces it; a sheet on phones). The viewer is a named `Route.layers` entry (Back and sessionStorage
-  restoration); picking an artifact pushes a viewer above the list.
+  which replaces it; a sheet on phones). Dragging a docked side panel's left edge resizes it; every side panel shares
+  that width, kept per browser (`p2-side-panel-width`; `useDragSize` in `src/web/drag-size.ts`, which the sidebar,
+  workspace and terminal use too). The viewer is a named `Route.layers` entry (Back and sessionStorage restoration);
+  picking an artifact pushes a viewer above the list.
   HTML/SVG use a sandboxed iframe, Markdown/text render safely,
   sent files use the conservative file preview. Nothing opens from a server update. `test/p2/artifacts.test.ts`
   covers fake-provider publication, versions, independent index, reload/restart, CSP, HEAD, guest isolation and
@@ -1226,8 +1229,13 @@ translated phone drawer and intercept chat taps.
   fills the width, fitted height, 70vh cap, card opens the viewer, unavailable version, guest), `tui-p11.test.ts`
   (inline Markdown).
 - **Conversations** (`plugins/conversations`): the `conversations` tool (`origin: "owner"`, `scope: "main"`) lists
-  active roots without starting workers, sends server-attributed peer input, and reads the latest completed text answer
-  (bounded scan, no thinking, including old history). A send carries the sending turn's origin to the recipient's
+  active roots without starting workers (with each one's location and project, and the projects), sends
+  server-attributed peer input, reads the latest completed text answer (bounded scan, no thinking, including old
+  history), creates a session at a project's place or a cwd with the message as its first peer input (its ID derived
+  from the call, so a retried call finds it; the sender's model and thinking level unless it names a signed-in model;
+  `SessionOperations.create`, shared with the owner's `Sessions.create`),
+  stops a session's run (as Stop in the chat), and archives or restores a session (`SessionOperations`; never
+  itself). A send carries the sending turn's origin to the recipient's
   `p2.peer-message` entry (`Conversations.query` and `PeerConversation.send` `origin`), so the recipient's turn may
   act for the owner when the owner started the sender's. `Conversations`
   accepts only current worker generations; `PeerConversation` accepts only the parent's `{ kind: "server" }`
@@ -1237,6 +1245,26 @@ translated phone drawer and intercept chat taps.
   navigate to roots (restoring archives); guests get plain labels. `test/p2/conversations.test.ts` covers list/send/
   answer, peer replies from the owner's turns, restart deduplication, concurrent cross-sends, busy answers, follow-ups,
   invalid destinations, reload, guest/forged attribution, child tool exclusion and inaccessible public ingress.
+- **Familiar** (`plugins/familiar`): one long-running session above the others that keeps track of them and starts,
+  steers, stops, archives and restores them. The server's `FamiliarStore` holds which session it is (persisted; the
+  ID is chosen before the row is made, so a crash makes the same one); the owner's `Familiar.open` makes it on first
+  use (home directory, default model, title "Familiar") or restores it when archived, one open at a time. Workers learn
+  whether they are it from their start data (`WorkerInitValues` key `familiar`). In its worker, the main conversation's
+  `pi.agent` gets `modelTools` (conversations, codemode, history_search/read/handoff) and `tools` (those plus `agent`,
+  `bash` and `read`, so scripts and one-shot agents can look at the file system) at each start; its extension adds the
+  `familiar` prompt section (role, notes in the code mode store key `familiar.notes`, finding folders).
+  **Compaction by cost** (`cold.ts`): while its prompt cache is warm a turn reads the context at about a tenth of the
+  input price and a summary (never cached) costs it all at full price, so only the regular cutoff applies; once cold
+  the next turn rewrites the cache at full price anyway, so it compacts first. Cold: the last answer's time plus the
+  model's cache lifetime (`getPromptCacheTtlMs`, `cacheRetention`) plus the 30 minutes the cache warmer refreshes while
+  idle (`cacheWarming: "idle"`, the default); at once for a model without a prompt cache. It compacts when the last
+  answer after the context's head reported at least 150k tokens, or the regular cutoff (window − `reserveTokens`) when
+  lower, compaction is enabled, and the conversation is idle: from a timer set after each answer (only while the
+  worker runs; an idle worker stops after 5 minutes without viewers or warming) and at each start, else in an
+  `InputGate` before the next input is admitted, which waits for the summary. Web: a `drawer-head:familiar` slot above
+  the drawer's folders; the sessions plugin's `DrawerRowsContext` (`plugins/sessions/contract.web.tsx`) gives it the
+  rows and `listApart`, which leaves its session out of its folder. The TUI lists it as an ordinary session. Tests:
+  `familiar.test.ts`, `ui-familiar.test.ts`, the conversations actions in `conversations.test.ts`.
 - **Subagents** (`plugins/subagents`): owns its protocol-independent Durable extension (persistent
   anchor conversations and exactly-once background reporter tasks, model/thinking/tool validation). The worker
   facet (an object of lifetime "host") contributes it to `Extensions` and catches up child metadata after relevant commits, retrying
