@@ -40,6 +40,7 @@ describe("activity panel in the app", { skip: !browserTests }, () => {
 		await until(chat.view, (view) => !live(view)?.run && JSON.stringify(view).includes("Echo: bash"), 30_000);
 		chat.release();
 		browser = await Browser.start();
+		await browser.signIn(fixture.owner);
 	});
 	after(async () => {
 		await browser?.close();
@@ -77,7 +78,7 @@ describe("activity panel in the app", { skip: !browserTests }, () => {
 		await browser.open(`http://127.0.0.1:${fixture.server.port}/s/${session}`);
 		await browser.wait("document.querySelector('[data-testid=activity]') && !document.querySelector('.offline')");
 		await browser.click("[data-testid=activity]");
-		await browser.wait("document.querySelector('#activity-dock .activity-panel')");
+		await browser.wait("document.querySelector('#side-dock .activity-panel')");
 		const box = await browser.evaluate<{ right: number; left: number; chatRight: number }>(`(() => {
 			const r=${panel}.getBoundingClientRect(), main=document.querySelector('.main').getBoundingClientRect();
 			return {right:r.right,left:r.left,chatRight:main.right};
@@ -92,7 +93,7 @@ describe("activity panel in the app", { skip: !browserTests }, () => {
 		await browser.click('button[aria-label="Workspace files and changes"]');
 		await browser.wait(`document.querySelector('.workspace') && !${panel}`);
 		await browser.evaluate("history.back()");
-		await browser.wait("document.querySelector('#activity-dock [data-testid=detail-command]')");
+		await browser.wait("document.querySelector('#side-dock [data-testid=detail-command]')");
 		await browser.call("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape" });
 		await browser.wait(`!${panel} && !history.state.route.activity`);
 	});
@@ -183,6 +184,7 @@ describe("a block's steps and active thought", { skip: !browserTests }, () => {
 	before(async () => {
 		fixture = await startFixture({ web: true });
 		browser = await Browser.start();
+		await browser.signIn(fixture.owner);
 	});
 	after(async () => {
 		await browser?.close();
@@ -190,6 +192,9 @@ describe("a block's steps and active thought", { skip: !browserTests }, () => {
 	});
 	const show = async (view: ConversationView, detail: 1 | 2 | 3 | 4 = 3, width = 1440) => {
 		await browser.metrics(width, 900);
+		// A new history entry: opening the same URL again keeps its route, and with it a panel an earlier test left open,
+		// which the test's first tap on the same block would close.
+		await browser.open("about:blank");
 		await browser.open(`http://127.0.0.1:${fixture.server.port}`);
 		await browser.wait("document.querySelector('.app')");
 		await browser.loadFixture("codemode-card.ts");
@@ -203,7 +208,7 @@ describe("a block's steps and active thought", { skip: !browserTests }, () => {
 		await browser.wait("document.querySelectorAll('.row [data-testid=activity]').length===2");
 		assert.deepEqual(
 			await browser.evaluate(
-				"[...document.querySelectorAll('.row')].map(r=>r.querySelector('[data-testid=activity]')?'activity':r.querySelector('[data-testid=thought]')?'thought':r.textContent.trim())",
+				"[...document.querySelectorAll('.row')].map(r=>r.querySelector('[data-testid=activity]')?'activity':r.querySelector('[data-testid=thought]')?'thought':r.textContent.replace(r.querySelector('.message-time')?.textContent??'','').trim())",
 			),
 			["thought", "First the tests.", "activity", "Now the fix.", "activity", "Fixed and tested."],
 		);
@@ -225,6 +230,52 @@ describe("a block's steps and active thought", { skip: !browserTests }, () => {
 		assert.equal(await browser.evaluate("document.querySelectorAll('.activity-block.selected').length"), 1);
 		await browser.click("[data-testid=activity]");
 		await browser.wait("document.querySelectorAll('[data-testid=step] > button[aria-expanded=true]').length===2");
+		await browser.evaluate("history.back()");
+		await browser.wait(`!${panel}`);
+	});
+
+	it("closes the panel when the same block is tapped again, but not when another block is", async () => {
+		await show(mixedTurn());
+		await browser.wait("document.querySelectorAll('.row [data-testid=activity]').length===2");
+		await browser.click("[data-testid=activity]");
+		await browser.wait(`${panel} && document.querySelectorAll('[data-testid=step]').length===2`);
+		await browser.evaluate("document.querySelectorAll('.row [data-testid=activity]')[1].click()");
+		await browser.wait("document.querySelectorAll('[data-testid=step]').length===1");
+		await browser.evaluate("document.querySelectorAll('.row [data-testid=activity]')[1].click()");
+		await browser.wait(`!${panel} && !history.state.route.activity`);
+		assert.equal(await browser.evaluate("document.querySelectorAll('.activity-block.selected').length"), 0);
+	});
+
+	it("shows when steps started, once per minute", async () => {
+		const minute = new Date().setHours(9, 5, 0, 0);
+		const entries: ConversationView["entries"][number][] = [];
+		respond(
+			entries,
+			[
+				call("a", "bash", { command: "one" }),
+				call("b", "bash", { command: "two" }),
+				call("c", "bash", { command: "three" }),
+			],
+			"toolUse",
+			{
+				// Started 09:05:03, 09:05:20 and 09:06:10: the second shares the first's minute.
+				a: { timestamp: minute + 5_000, durationMs: 2_000 },
+				b: { timestamp: minute + 20_000 },
+				c: { timestamp: minute + 70_000 },
+			},
+		);
+		await show({ conversation, entries, docs: {} });
+		await browser.click("[data-testid=activity]");
+		await browser.wait("document.querySelectorAll('[data-testid=step]').length===3");
+		// In the browser's locale.
+		const clock = (at: number) =>
+			browser.evaluate<string>(`new Date(${at}).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })`);
+		assert.deepEqual(
+			await browser.evaluate(
+				"[...document.querySelectorAll('[data-testid=step]')].map((e) => e.querySelector('.step-time')?.textContent ?? '')",
+			),
+			[await clock(minute + 3_000), "", await clock(minute + 70_000)],
+		);
 		await browser.evaluate("history.back()");
 		await browser.wait(`!${panel}`);
 	});
@@ -449,7 +500,7 @@ describe("a block's steps and active thought", { skip: !browserTests }, () => {
 		await browser.metrics(390, 844);
 		await browser.wait(`${mobileSheet}?.querySelector('[data-testid=detail-command]')`);
 		await browser.metrics(1440, 900);
-		await browser.wait("document.querySelector('#activity-dock [data-testid=detail-command]')");
+		await browser.wait("document.querySelector('#side-dock [data-testid=detail-command]')");
 		assert.equal(await browser.evaluate("document.querySelector('.sheet-layer')"), null);
 	});
 
