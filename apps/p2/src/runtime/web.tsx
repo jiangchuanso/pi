@@ -25,11 +25,13 @@ import {
 	HOME,
 	type Layer,
 	Navigation,
+	NEW_SESSION,
 	type Route,
 	useScrollMemory,
 } from "../web/navigation.ts";
 import { type SettingsEmbed, useSettingsEmbed } from "../web/settings-embed.ts";
 import { useSheetSwipe } from "../web/sheet-swipe.ts";
+import { setSidebarCollapsed } from "../web/sidebar.ts";
 import type { Host, VariantOf } from "./chord.ts";
 
 export {
@@ -410,7 +412,7 @@ export function useRoute(): Route {
 	return useSyncExternalStore(nav.subscribe, nav.snapshot, nav.snapshot);
 }
 
-/** Conversation destinations close modal layers and carry open workspace/terminal panels. */
+/** Conversation destinations close modal layers and open with their session's panels (`conversationRoute`). */
 export function navigate(next: Partial<Route>, options: { replace?: boolean } = {}): void {
 	const nav = getNavigation();
 	const destination = next.layers
@@ -419,6 +421,19 @@ export function navigate(next: Partial<Route>, options: { replace?: boolean } = 
 	if (options.replace) void nav.replace(destination);
 	else if (next.layers) void nav.push(destination);
 	else void nav.closeThenPush(() => destination);
+}
+
+/**
+ * A sidebar rollup's or group's list in the main area (`Route.page`). As opening a conversation, it closes the phone drawer
+ * and modal layers; Back returns to where the reader was.
+ */
+export function openPage(page: string): void {
+	void getNavigation().closeThenPush(() => ({ ...HOME, page }));
+}
+
+/** The new-session screen (`NEW_SESSION`). As opening a conversation, it closes the phone drawer and modal layers. */
+export function openNewSession(): void {
+	void getNavigation().closeThenPush(() => NEW_SESSION);
 }
 
 /** Named plugin modal: locators are small serialized values, not component state. */
@@ -435,6 +450,12 @@ export function closeLayers(): void {
 export function setDrawer(open: boolean): void {
 	if (open) openLayer({ kind: "drawer" });
 	else closeLayers();
+}
+
+/** Shows the sessions: the docked sidebar from 900px (expanding it if collapsed), the drawer below. */
+export function openSidebar(): void {
+	if (window.matchMedia("(min-width: 900px)").matches) setSidebarCollapsed(false);
+	else setDrawer(true);
 }
 
 export function useDrawer(): boolean {

@@ -8,6 +8,7 @@ import {
 	grantMode,
 	type Held,
 	isChordError,
+	keptIn,
 	liveIn,
 	serveKeyed,
 	UI_LINGER,
@@ -25,6 +26,7 @@ import {
 	conversationRoute,
 	type Detail,
 	DownIcon,
+	ErrorToast,
 	errorText,
 	type FileCompletion,
 	FileCompletionPopover,
@@ -46,12 +48,14 @@ import {
 	type ModelChoice,
 	ModelPicker,
 	modelName,
+	NEW_SESSION,
 	navigate,
 	OneShotAgents,
 	OpenConversation,
 	OpenTerminal,
 	OpenWorkspaceFile,
 	openLayer,
+	openSidebar,
 	type PickedFile,
 	PiLogo,
 	PlusIcon,
@@ -68,8 +72,6 @@ import {
 	Slots,
 	StopIcon,
 	seedSizes,
-	setDrawer,
-	setSidebarCollapsed,
 	ToolActivities,
 	ToolActivityContext,
 	type Transcript,
@@ -110,8 +112,11 @@ import { createPortal } from "react-dom";
 import { Drafts } from "../drafts/contract.ts";
 import { Envs } from "../envs/contract.ts";
 import { DirectoryPicker, directoryPickerLayer } from "../envs/contract.web.tsx";
+import { GlyphIcon } from "../glyphs/GlyphIcon.tsx";
+import { placeSeed } from "../glyphs/seed.ts";
 import { Models } from "../models/contract.ts";
 import type { ResourceSnapshot } from "../models/resources.ts";
+import { Projects } from "../projects/contract.ts";
 import { type Session, Sessions } from "../sessions/contract.ts";
 import { SessionMetrics, SessionStatus, WorkerControl } from "../status/contract.ts";
 import { type Child, conversationLocation, SubagentControl, Subagents } from "../subagents/contract.ts";
@@ -228,6 +233,8 @@ type PageObjects = {
 	readonly models: Held<typeof Models> | undefined;
 	/** The owner's only. */
 	readonly envs: Held<typeof Envs> | undefined;
+	/** The owner's only: projects.json and the sessions' projects, for the top bar's project glyph. */
+	readonly projects: Held<typeof Projects> | undefined;
 };
 
 const PageObjectsContext = createContext<PageObjects | undefined>(undefined);
@@ -310,15 +317,6 @@ function ModelControl({ resources, choice }: { resources: ResourceSnapshot | und
 			</span>
 		</button>
 	);
-}
-
-/** The composer's error; tapping it dismisses it. */
-function ErrorToast({ error, onDismiss }: { error: string | undefined; onDismiss: () => void }) {
-	return error ? (
-		<button type="button" className="toast" onClick={onDismiss}>
-			{error}
-		</button>
-	) : null;
 }
 
 /** Textarea with send, stop, steer and attachments; Enter sends with a fine pointer, Escape stops. */
@@ -606,8 +604,19 @@ function TopBar({
 	const nav = useNavigation();
 	const route = useRoute();
 	// Only the owner reads environments (`PageObjects.envs`): guests see the location without the sandbox lock.
-	const envs = useReadable(usePageObjects().envs?.envs);
+	const objects = usePageObjects();
+	const envs = useReadable(objects.envs?.envs);
 	const sandboxed = envs?.find((env) => env.name === session?.env)?.config.type === "gondolin";
+	// The project glyph the sidebar shows for this session (guests read no projects: the path's own glyph).
+	const kept = keptIn(objects.projects, "owner");
+	const projects = useReadable(kept?.projects);
+	const memberships = useReadable(kept?.sessions);
+	const glyph = session && (
+		<GlyphIcon
+			seed={placeSeed(projects ?? [], session.env ?? null, session.cwd, memberships?.[session.id])}
+			size={11}
+		/>
+	);
 	const lock = sandboxed && (
 		<span className="title-lock">
 			<LockIcon size={11} />
@@ -615,15 +624,9 @@ function TopBar({
 	);
 	return (
 		<header className="topbar">
-			<button
-				type="button"
-				className="icon-button menu sidebar-open"
-				onClick={() =>
-					window.matchMedia("(min-width: 900px)").matches ? setSidebarCollapsed(false) : setDrawer(true)
-				}
-				aria-label="Sessions"
-			>
+			<button type="button" className="icon-button menu sidebar-open" onClick={openSidebar} aria-label="Sessions">
 				<MenuIcon />
+				<Slot name="menu-badge" />
 			</button>
 			<div className="title">
 				{child ? (
@@ -655,12 +658,16 @@ function TopBar({
 									) : (
 										<>
 											{lock}
+											{glyph}
 											{locationLabel(session.env, session.cwd)}
 										</>
 									)}
 								</button>
 							) : (
-								<p>{locationLabel(session.env, session.cwd)}</p>
+								<p>
+									{glyph}
+									{locationLabel(session.env, session.cwd)}
+								</p>
 							))}
 					</>
 				)}
@@ -781,7 +788,7 @@ function SessionChat({ sessionId, conversationId }: { sessionId: string; convers
 			// What this device kept of a session the server no longer has goes with it (an archived one stays).
 			if (!session) void forgetSession(sessionId);
 			toast(session ? "Session is archived" : "Session not found");
-			void nav.replace(conversationRoute(current, undefined), current);
+			void nav.replace(NEW_SESSION, current);
 		}
 	}, [listed, session, nav, sessionId, toast]);
 	// Who this browser is, as the server last said: kept while reconnecting (`useOwner`), so the composer stays.
@@ -883,7 +890,6 @@ function SessionChat({ sessionId, conversationId }: { sessionId: string; convers
 		setDraft,
 		steer,
 		setSteer,
-		error,
 		setError,
 		files,
 		setFiles,
@@ -1454,7 +1460,7 @@ function SessionChat({ sessionId, conversationId }: { sessionId: string; convers
 				/>
 			)}
 
-			<ErrorToast error={error} onDismiss={() => setError(undefined)} />
+			<ErrorToast />
 			{place(
 				<div className="scroller transcript" ref={follow.scroller}>
 					{failure && connected ? (
@@ -1551,7 +1557,14 @@ function NewSession() {
 	const sessions = liveIn(catalog, "owner");
 	const [resources, setDefault] = useModelResources(useComposerState().fail);
 	const recent = useMemo(() => (listed ?? []).toSorted((a, b) => b.updatedAt - a.updatedAt), [listed]);
-	const { location: selectedLocation, setLocation, choice: selectedChoice, setChoice } = useNewSessionState();
+	const {
+		location: selectedLocation,
+		setLocation,
+		join,
+		setJoin,
+		choice: selectedChoice,
+		setChoice,
+	} = useNewSessionState();
 	const location =
 		selectedLocation ?? (recent[0] ? { env: recent[0].env ?? null, cwd: recent[0].cwd } : { env: null, cwd: "~" });
 	const fallback = resources?.settings.defaultModel ?? recent[0]?.model;
@@ -1562,7 +1575,7 @@ function NewSession() {
 		(entry) => entry.provider === choice?.model.provider && entry.modelId === choice?.model.modelId,
 	)?.contextWindow;
 	const composer = useComposerState();
-	const { draft, setDraft, files, setFiles, error, setError, steer, setSteer, setStopped } = composer;
+	const { draft, setDraft, files, setFiles, setError, steer, setSteer, setStopped } = composer;
 	const cwdSheet = useSheet("cwd");
 	const modelSheet = useSheet("model");
 	const attaching = attachingOf(composer);
@@ -1595,7 +1608,7 @@ function NewSession() {
 				item: outgoingItem(id, text, files, OWNER_AUTHOR),
 			},
 			// The page chooses the session's ID: a retried creation answers the same session.
-			{ session: crypto.randomUUID(), location, choice },
+			{ session: crypto.randomUUID(), location, choice, ...(join ? { join } : {}) },
 		);
 		setDraft("");
 		setFiles([]);
@@ -1616,7 +1629,7 @@ function NewSession() {
 			return;
 		}
 		sessionStart.connect({
-			create: async ({ session, location, choice }) => {
+			create: async ({ session, location, choice, join }) => {
 				// The new session's worker starts beside the creation, not after it (its start waits for the row): held
 				// here and lingering for the session's view, which holds it next.
 				const chat = host.hold(Chat, { session, conversation: 1 }, BACKGROUND_CONTEXT);
@@ -1636,10 +1649,15 @@ function NewSession() {
 					chat.release();
 					throw error;
 				}
+				// A project's "+": the session joins the project once it exists, so a refused creation leaves no membership
+				// behind; a failed join leaves the session as it is, and the toast says why.
+				if (join) void join.run(session).catch(composer.fail);
 			},
 			// The server's own errors (a missing directory, an unknown model) refuse; a lost connection is tried again.
 			refused: (error) => !isChordError(error) || refused(error),
 			created: (session) => {
+				// The next new session starts in no project unless its "+" is used again.
+				setJoin(undefined);
 				if (shownHere.current) navigate({ session }, { replace: true });
 			},
 			restore: (messages, error) => {
@@ -1649,7 +1667,7 @@ function NewSession() {
 			},
 		});
 		return () => sessionStart.connect(undefined);
-	}, [connected, sessions, host, setDraft, setFiles, setError]);
+	}, [connected, sessions, host, setDraft, setFiles, setError, setJoin, composer.fail]);
 	// Leaving the page loses a session not created yet: the browser asks first.
 	useEffect(() => {
 		if (!start) return;
@@ -1708,7 +1726,7 @@ function NewSession() {
 					onClose={closeLayers}
 				/>
 			)}
-			<ErrorToast error={error} onDismiss={() => setError(undefined)} />
+			<ErrorToast />
 			{place(
 				<div className={outgoing ? "scroller transcript" : "scroller"} ref={follow.scroller}>
 					{outgoing && rows ? (
@@ -1726,6 +1744,7 @@ function NewSession() {
 							>
 								<FolderIcon />
 								<span>{locationLabel(location.env, location.cwd)}</span>
+								{join && <small className="cwd-join">in {join.label}</small>}
 								<ChevronIcon size={14} />
 							</button>
 							{owner && resources && !resources.credentials.length && (
@@ -1770,9 +1789,10 @@ function Main() {
 	const status = useObject(SessionStatus, {});
 	const models = useObject(Models, owner ? {} : undefined);
 	const envs = useObject(Envs, owner ? {} : undefined);
+	const projects = useObject(Projects, owner ? {} : undefined);
 	const objects = useMemo(
-		() => ({ sessions, access, subagents, status, models, envs }),
-		[sessions, access, subagents, status, models, envs],
+		() => ({ sessions, access, subagents, status, models, envs, projects }),
+		[sessions, access, subagents, status, models, envs, projects],
 	);
 	const grant = useReadable(liveIn(access, "guest")?.grant);
 	// A guest stays within the sessions shared with it; anywhere else it lands in the one shared or joined last.
@@ -1804,8 +1824,11 @@ function Main() {
 							<SessionChat key={conversation} sessionId={route.session} conversationId={shownConversation} />
 						</Slot>
 					</Slot>
-				) : (
+				) : route.newSession ? (
 					<NewSession />
+				) : (
+					// Home: what a plugin shows there (the Familiar opens its session), else the new-session screen.
+					<Slot name="home" fallback={<NewSession />} />
 				)}
 				{/* The transcript of the screen above goes into the view (`useChatScreen`), the dock floats over its bottom. */}
 				<div className="chat">
