@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-11-09
+
 ### New Features
 
 - **Shell login and logout**: use `pi auth login <provider>` and `pi auth logout <provider>` without starting a session, with API-key and no-browser sign-in options. See [Credential commands](docs/cli.md#credential-commands).
@@ -40,6 +42,7 @@
 - The OpenAI Codex provider is shown as "OpenAI Codex" again instead of "OpenAI Codex (legacy)" in `/login` and the model selector
 - The `/login` and `/logout` provider lists and `/login <provider>` completions now show the preferred partners Radius and OpenRouter first, then all other providers alphabetically. In the provider lists, partners are marked with `✦`, the selected Radius row shimmers in the Radius logo colors and the selected OpenRouter row glows in OpenRouter's brand color (lime on dark themes, violet on light themes)
 - Upgraded terminal Mermaid rendering to support more diagram types, including pie charts, author-defined styles, and clickable labels on terminals with hyperlink support ([#8158](https://github.com/earendil-works/pi/pull/8158) by [@xl0](https://github.com/xl0))
+- When a session's working directory no longer exists, for example after the project folder was renamed, interactive mode now offers `Continue`, `Fork`, or `Cancel` instead of only continuing. `Continue` runs the session in the current directory without storing the choice, as before; `Fork` copies it into the current directory as a new session with a new ID, like `--fork`, so the next resume no longer asks. This applies at startup (`--session`, `--resume`), to `/resume`, to `/import`, and to `ctx.switchSession()` from extensions ([#11060](https://github.com/earendil-works/pi/issues/11060))
 
 ### Fixed
 
@@ -55,6 +58,7 @@
 - Fixed the grep tool reading every matched file into memory when `context` was set, which ran out of memory on large files; context now comes from ripgrep, which also fixes UTF-16 files and lone CRs in matched lines, and the match limit notice no longer appears when exactly `limit` matches exist ([#9276](https://github.com/earendil-works/pi/issues/9276), [#11423](https://github.com/earendil-works/pi/issues/11423))
 - Fixed the find tool reporting the result limit when exactly `limit` files match, and `limit: 0` in find and ls returning every result or an empty listing; limits below 1 now mean 1 ([#7121](https://github.com/earendil-works/pi/issues/7121))
 - Fixed grep match lines, codemode output, compaction summaries of tool results, and MCP error and server summaries cutting an emoji or other non-BMP character in half when truncating, which left an invalid lone surrogate in the text ([#7121](https://github.com/earendil-works/pi/issues/7121))
+- Fixed the find tool on Windows returning no results for patterns with Windows separators such as `src\**\*.ts`, and for every path pattern such as `src/**/*.ts` with fd 10.5.1, which pi now downloads. Windows path patterns now match the same way with every fd version: `src/**/*.ts` also finds files directly in `src/`, and `src/*.ts` no longer finds files in subdirectories ([#9262](https://github.com/earendil-works/pi/issues/9262))
 - Fixed the read tool loading whole files into memory, which ran out of memory on large files even with `offset`/`limit`; it now streams the file and keeps only the shown lines. Custom `ReadOperations` can stream too by providing the new optional `createReadStream` ([#9654](https://github.com/earendil-works/pi/issues/9654))
 - Fixed OAuth logins such as `openai` and `anthropic` failing with `invalid_grant` after pi was stopped while it refreshed an expired token, for example an RPC client that stops pi right after startup while the background catalog refresh runs. The token endpoint had already replaced the refresh token, but pi exited before saving the new one. On exit, pi now waits for a token refresh in progress to be saved ([#11692](https://github.com/earendil-works/pi/issues/11692))
 - Fixed Ctrl+P not switching to the only model in scope (or the only available model) when the active model is a different one; it showed "Only one model in scope" instead. Cycling forward from a model outside the scope now also selects the first scoped model instead of skipping it ([#11806](https://github.com/earendil-works/pi/issues/11806))
@@ -113,6 +117,8 @@
 - Fixed MCP stdio server subprocesses surviving disconnect or pi exit on POSIX when the server's main process had already exited ([#11721](https://github.com/earendil-works/pi/issues/11721))
 - Fixed MCP Streamable HTTP JSON replies bypassing message-size limits and HTTP errors buffering entire response bodies. Oversized replies and error-body content beyond the first 8 KiB are now cancelled ([#11335](https://github.com/earendil-works/pi/issues/11335))
 - Fixed valid tool arguments being rejected when their schema combined local `$ref`s with a relative root `$id`, such as `schemas/tool.json` ([#11697](https://github.com/earendil-works/pi/issues/11697))
+- Fixed the find tool starting an untracked `fd` process when cancelled during its parent-directory lookup ([#11974](https://github.com/earendil-works/pi/pull/11974) by [@petrroll](https://github.com/petrroll))
+- Fixed `/import` of a session whose working directory no longer exists leaving a copy in the session directory, and continuing it leaving a second copy with the same ID (`s.jsonl` and `s-1.jsonl`); the failed copy is now removed ([#11060](https://github.com/earendil-works/pi/issues/11060))
 
 ## [1.5.0] - 2026-11-02
 
