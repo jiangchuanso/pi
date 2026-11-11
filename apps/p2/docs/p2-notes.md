@@ -469,6 +469,10 @@ npm start
   Host/Origin, public `X-Forwarded-*` and rewritten localhost redirects, without the relay secret. Pi's own
   port cannot be forwarded. Links appear after the owner opens Pi through Radius and survive restart;
   on-device Open uses localhost. Radius sees forwarded traffic; this is not a sandbox.
+- **Shell page and share links**: the brain keeps its page in the Radius shell, `<shell>/pi/<organization ID>/<brain>`,
+  from the relayed requests' shell origin (`radius.json` `shellPage`; one saved in the older `/pi/brains/…` form is
+  read in the current one). People a session is shared with by email get `<shell page>/s/<session>`. The shell names
+  the organization by its slug once it opens; a kept link names it by ID, which a slug change leaves valid.
 - The worker's root-only `ports` tool has `list/open/close`, fixes owner/peer attribution at its calling assistant
   entry, and denies guest/unattributed turns. It lists every forward and explicitly names all public endpoints,
   asks the model to obtain confirmation before publishing. As in Pi Mobile (67cdb4ca4) it may change or close any
@@ -510,6 +514,27 @@ sidebar rollup's or group's list (`page`). Only the top modal shows. The stack a
 tab's sessionStorage; URLs identify conversations (`/s/<id>` and `/s/<id>/c/<conversation>`) and section lists
 (`/list/<key>`), not modal payloads. Restored locators may be unavailable.
 
+- **Links that open in another tab.** In-app destinations are real `<a href>` links whose click handler is
+  `inPage(act)`: a plain primary click acts in the page; Cmd/Ctrl/Shift/Alt clicks, the middle button and "Open in
+  new tab" stay the browser's. Links take their address from `useLinkHref()` (`linkHref`): `routeHref`, which adds
+  the top layer when it is a viewer (`/s/<id>?viewer=<name>&at=<locator>`); sidebar rows and list pages have none, so
+  theirs is `routePath`.
+  A page loading such an address starts with that viewer over the conversation (`pathRoute(path, search)`); the
+  address bar then shows the conversation's path again. Only viewers are linkable: they only show content, and every
+  content fetch is authorized by its route, so a link (also another site's) cannot open a sheet that acts. Not yet
+  links: the "Back to main conversation" and parent-session buttons, peer-message attributions, Discord's bound
+  sessions.
+- **Framed by the Radius shell** (`src/web/shell-bridge.ts`). Through Radius the app runs in a frame of the shell
+  (`radius.earendil.com/pi/<organization>/<brain>`) on the brain's origin. The page names the shell's origin
+  (`<meta name="p2-shell-origin">`, relayed requests only), and the bridge speaks the frame's side of the shell's
+  `pi-shell` channel: `ready` on load, the route's `routeHref` as `location` after every navigation, and the shell's
+  `hello` base becomes the base of `linkHref`, so a link opened in another tab, or copied, is the shell's URL
+  (`…/pi/acme/<brain>/s/<id>`), not the frame's. The shell only replaces its URL with each report; the app's history
+  entries stay the tab's, so Back moves the frame. Messages go to the shell's origin only; nothing is posted when the
+  page is not framed or not relayed. The shell's side and the contract: Radius,
+  `client/src/views/pi-shell/frame-bridge.ts`. `test/p2/shell-bridge.test.ts` (origins, reports, base) and
+  `test/p2/ui-shell-frame.test.ts` (the real bundle framed by a stand-in shell on another site: mirrored URL, links,
+  one history entry per step, Back and Forward).
 - `push`: one step at the tap; `replace`: lateral changes and server/startup corrections. A correction can pass
   its captured route as `replace(next, expected)` so it cannot overwrite a later queued destination.
 - `close`: whole-modal ×/scrim/Escape, or a sheet/file parent; `reset`: workspace tabs, dropping visited files/commits.
@@ -1395,7 +1420,8 @@ startup fencing, the list marker, owner notice, worker-filtered Show logs and re
   which replaces it; a sheet on phones). Dragging a docked side panel's left edge resizes it; every side panel shares
   that width, kept per browser (`p2-side-panel-width`; `useDragSize` in `src/web/drag-size.ts`, which the sidebar,
   workspace and terminal use too). The viewer is a named `Route.layers` entry (Back and sessionStorage restoration);
-  picking an artifact pushes a viewer above the list.
+  picking an artifact pushes a viewer above the list. Cards and list rows are links to the viewer (`ViewerHref`,
+  Browser navigation), so a modified or middle click opens it in another tab.
   HTML/SVG use a sandboxed iframe, Markdown/text render safely,
   sent files use the conservative file preview. Nothing opens from a server update. `test/p2/artifacts.test.ts`
   covers fake-provider publication, versions, independent index, reload/restart, CSP, HEAD, guest isolation and

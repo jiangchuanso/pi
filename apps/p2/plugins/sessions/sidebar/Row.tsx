@@ -7,17 +7,19 @@ import {
 	BranchIcon,
 	type CommandTargetRow,
 	HOME,
+	inPage,
 	locationLabel,
 	NavDisclosureIcon,
 	NavEditIcon,
 	NavWarningIcon,
 	PinIcon,
-	routePath,
+	type Route,
 	SideNavigation,
 	shortPath,
 	useCommandTargetRow,
+	useLinkHref,
 } from "@p2/app/v1/web";
-import { type MouseEvent, type ReactNode, useEffect, useId, useState, useSyncExternalStore } from "react";
+import { type ReactNode, useEffect, useId, useState, useSyncExternalStore } from "react";
 import { GlyphIcon } from "../../glyphs/GlyphIcon.tsx";
 import type { Activity, GlyphSeed, SidebarRow } from "./model.ts";
 
@@ -113,18 +115,8 @@ export function folderName(env: string | null, cwd: string, segments: number): s
 	return env ? `${base} · ${env}` : base;
 }
 
-/**
- * A click handler for a link that acts in the page (`act`) on a plain primary click; any other click (a modifier, the
- * middle button, "Open in new tab") is the browser's, so the target opens in another tab or window.
- */
-export const inPage = (act: () => void) => (event: MouseEvent<HTMLAnchorElement>) => {
-	if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-	event.preventDefault();
-	act();
-};
-
-/** The address of a rollup's or a group's list page. */
-export const pageHref = (page: string): string => routePath({ ...HOME, page });
+/** The route of a rollup's or a group's list page, for its link (`useLinkHref`). */
+export const pageRoute = (page: string): Route => ({ ...HOME, page });
 
 const SCOPES_KEY = "p2-sidebar-opened-from";
 const scopeListeners = new Set<() => void>();
@@ -325,6 +317,7 @@ export function SessionItem({
 	actions: RowActions;
 	glyph?: GlyphSeed;
 }) {
+	const linkHref = useLinkHref();
 	const {
 		activeId,
 		activeScope,
@@ -377,7 +370,7 @@ export function SessionItem({
 		// The main conversation is selected on the session's row.
 		const selected = active && conversationId === item.conversation && item.conversation !== session.main;
 		const busy = session.worker.busy.includes(item.conversation) ? <WorkingMark /> : null;
-		const href = routePath({ session: session.id, conversation: item.conversation, layers: [] });
+		const href = linkHref({ session: session.id, conversation: item.conversation, layers: [] });
 		if (item.kind === "branch") {
 			const main = item.conversation === session.main;
 			return (
@@ -487,7 +480,7 @@ export function SessionItem({
 					? { title: "Restore and open" }
 					: {
 							title: glyph?.title,
-							href: routePath({ session: session.id, conversation: session.main, layers: [] }),
+							href: linkHref({ session: session.id, conversation: session.main, layers: [] }),
 						})}
 				onActivate={() => {
 					if (archived) {
