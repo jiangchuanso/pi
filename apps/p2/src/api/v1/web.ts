@@ -17,7 +17,9 @@ export {
 } from "../../web/command-menu/context.ts";
 export { useCommandMatches } from "../../web/command-menu/match.ts";
 export {
+	type CommandMenuRow,
 	type CommandTargetRow,
+	useCommandMenuRow,
 	useCommandRouteTarget,
 	useCommandTargetRow,
 } from "../../web/command-menu/targets.ts";
@@ -43,6 +45,7 @@ export * from "../../web/SessionStats.tsx";
 export * from "../../web/SettingsNav.tsx";
 export * from "../../web/SidePanel.tsx";
 export * from "../../web/Switch.tsx";
+export * from "../../web/shared-context.ts";
 export * from "../../web/sidebar.ts";
 export * from "../../web/ThemeButton.tsx";
 export { setTheme, type ThemePreference } from "../../web/theme.ts";
