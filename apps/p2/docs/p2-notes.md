@@ -670,6 +670,32 @@ syntax/startup errors are retained too. Focused tests: `logs.test.ts`, `ui-logs.
 `test-host.test.ts`; the browser regression exercises the original `Unknown p2 plugin: settings` failure, sticky
 startup fencing, the list marker, owner notice, worker-filtered Show logs and recovery through Retry.
 
+**Telemetry** (Chord §29; always on, no sampling: Chord offers none): the server records to `<data>/telemetry.sqlite`
+(`openTelemetry`, `src/runtime/host-dirs.ts`; Chord's SQLite store, 7 days, a queue of 10,000 spans, a flush every
+second; its own private file, never in a backup), its only writer. Each session worker records in memory (its host's
+spans and metrics, and Durable's `pi.durable.*` and pi-ai's `pi.ai.*`: the Harness gets the same adapter) and sends
+to the server's `WorkerTelemetry` every second and when it closes (`src/hosts/worker.ts`), stamped `chord.host:
+session|<id>`. Owners' pages record too (`#root` `data-p2-telemetry`, set by `web.ts` for owners; `startPage({
+telemetry: true })`) and send to `PageTelemetry` every 3 s and when hidden; the server admits owners only
+(`telemetryIngestFacet({ admit })`: a guest could open page after page, each with its own budget). Carriers join a
+page's call, the server's relay and the worker's method into one trace; React's holds are roots of the page's own
+traces. What a span records about its principal is `principalAttributes` (`src/runtime/principals.ts`):
+`p2.principal` (`owner:<access>`, `guest`, `worker`, `server`, `host`) and a guest's id or a worker's session,
+never a name or an email. Read with `node --import ./src/source.ts scripts/traces.ts [--name] [--attr k=v]
+[--errors] [--since <minutes>] [--limit]` (read-only, safe while the server runs), or in the page and by the agent
+(`plugins/telemetry`): `Traces` (server) reads the store (`ServerParts.telemetry`) with bounds (50 traces a page,
+2000 spans a trace, 1000 metric rows, 8 attribute filters); variant `owner` for owners, `agent` for a session's worker,
+refused at every call while that session is shared (any link, guest or person: viewers read what the agent finds) or
+locked; anyone else `forbidden`. The Traces view kind (a pane: search by the first span's name, attributes, errors and
+a window; traces newest first, more by cursor; one trace as a span tree on its timeline with attributes, events and
+links that open their trace; list or trace on narrow panes, side by side from 620px), also a Settings section (a trace
+a layer of the sheet) and the command "Show traces" (owners). The agent's code-mode tools, namespace `telemetry`
+(`telemetry_find_traces`, `telemetry_get_trace`: `renderTrace` text and the spans, `telemetry_find_metrics`;
+`locked: "never"`; deferred: the code-mode section names the namespace only, `describeNamespace("telemetry")` gives
+the declarations, so they take no place from the tools the agent uses all the time). Test: `telemetry-traces.test.ts`. Cost: Chord's (§30): a span per
+call, hold, method, relay and activation; nothing is measured or walked for it. The TUI records nothing. Test:
+`telemetry.test.ts`.
+
 ## Decisions
 
 - **Where p2 differs from Pi Mobile on purpose** (from the parity audit before Pi Mobile was retired):
@@ -1373,7 +1399,13 @@ startup fencing, the list marker, owner notice, worker-filtered Show logs and re
   `SettingsSections` (`src/runtime/web-core.ts`) once, keyed by its sheet layer's name, with `label`, `title`,
   `order` (the list sorts by it, then by key), `Sheet` (renders its sheet while the route opens it; the app's layout
   keeps every one mounted, `SettingsSectionSheets` in `src/web/SettingsNav.tsx`) and optionally `Shown` (Voice: only
-  with a speech service). The section is that sheet's layer right above `settings`. While the window is open, every `Sheet` renders as a page in
+  with a speech service). The section is that sheet's layer right above `settings`. The owner's page holds the small
+  owner-only objects of the sections from its start, in components mounted all along, and hands the sections that
+  reference (a new `useObject` would be a new hold, a round trip): `Settings` and `ServerNameSettings` (the gear,
+  `HeldSettings`), `ProviderLogin` (the Providers slot), `Devices` (the Devices slot), `Discord` (`DiscordSheets`,
+  `held.ts`). Not held ahead: `Envs` and `Ports` (derived from the session catalog: re-sent as sessions change),
+  `Mcp` (the servers' tool lists), Logs (lines), Traces (calls only). Measured with a 150 ms round trip: General
+  470 ms → 20 ms, Discord 160 → 8 ms, Devices 326 → 160 ms (its token is a call). While the window is open, every `Sheet` renders as a page in
   its pane (`SettingsPane`, `src/web/settings-embed.ts`): its title and Back, no scrim or × of its own (the window's
   close everything), `sheet-body` kept for the plugin's styles. The same sheets opened elsewhere (Sign in to a
   provider, a session's logs or Discord link) stay sheets of their own.
