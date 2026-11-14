@@ -559,9 +559,41 @@ tab's sessionStorage; URLs identify conversations (`/s/<id>` and `/s/<id>/c/<con
   (`…/pi/acme/<brain>/s/<id>`), not the frame's. The shell only replaces its URL with each report; the app's history
   entries stay the tab's, so Back moves the frame. Messages go to the shell's origin only; nothing is posted when the
   page is not framed or not relayed. The shell's side and the contract: Radius,
-  `client/src/views/pi-shell/frame-bridge.ts`. `test/p2/shell-bridge.test.ts` (origins, reports, base) and
-  `test/p2/ui-shell-frame.test.ts` (the real bundle framed by a stand-in shell on another site: mirrored URL, links,
-  one history entry per step, Back and Forward).
+  `client/src/views/pi-shell/frame-bridge.ts`. `test/p2/shell-bridge.test.ts` (origins, reports, base, theme
+  messages) and `test/p2/ui-shell-frame.test.ts` (the real bundle framed by a stand-in shell on another site:
+  mirrored URL, links, one history entry per step, Back and Forward, the shell's theme).
+- **Theme** (`src/web/theme.ts`). The light/dark preference lives in the outermost host, and the page picks a backend at
+  startup: `native` when p2-mac's `window.webkit.messageHandlers.piHost` exists (the app's `appearance`; `theme` and
+  `set-theme` messages with replies, `pi-host-theme` events; "system" resolves with `matchMedia`, which follows the
+  app's appearance), `shell` when the Radius shell frames the page (the meta, a plain origin, and a parent) and its
+  `hello` carries `theme` (the shell's `pi-theme`; the page applies the shell's resolved `scheme`, sends `set-theme`,
+  takes the `theme` echo), else `local` (the origin's localStorage `pi-theme`, as before). Hosted pages never read or
+  write their own stored value; the first-paint scripts skip it by the same rule (the app page's in `src/hosts/web.ts`;
+  the server pages' in `src/runtime/page.ts` skip it in any frame, since the CSP lets only the shell frame them). Picks
+  apply at once and the host's answer wins; two quick picks never flicker back: the shell answers each `set-theme`
+  with one `theme`, and the page drops `theme` messages until its last pick's answer (the count resets on `hello`);
+  with p2-mac it ignores `pi-host-theme` while a `set-theme` is unanswered and takes the latest request's answer.
+  Before `hello` a framed page follows the system, ignores its storage and `storage` events and keeps a pick in
+  memory: a `hello` with `theme` sends that pick as `set-theme` (else takes the shell's preference), a `hello` without
+  `theme` (an older shell) stores the pick or, without one, reads the stored value; without any `hello` the pick stays
+  in memory. Before `hello` a framed page shows the scheme the shell hinted in the URL it framed
+  (`#pi-shell-scheme=light|dark`): WebKit (26.6) resolves a cross-site frame's `prefers-color-scheme` with the
+  system's, not the embedder's `color-scheme` as Chrome does, so a shell forcing the opposite of the system would
+  otherwise paint the frame wrong until `hello`. The app page's first-paint script reads the hint only in a shell
+  frame (exactly that fragment; any other stays), paints it, keeps it for `theme.ts` as `<html data-pi-shell-scheme>`
+  and removes the fragment with `history.replaceState(history.state, "", pathname + search)` before the app reads the
+  URL (navigation.ts reads `location` when the bundle starts; nothing reads the fragment). Without a hint: the
+  system's scheme. A change of the shown scheme after load cross-fades: `theme.ts` makes the DOM change in
+  `document.startViewTransition({ update, types: ["pi-theme"] })` (the function form where types are missing), the
+  browser's default cross-fade of the page, about 250 ms; no CSS of its own (scope any to
+  `:active-view-transition-type(pi-theme)`). Each document fades its own pixels: the Radius shell keeps its frame out
+  of its snapshot, p2-mac fades only its native views. No fade for what the page shows while starting (first paint,
+  hint, before the first frame, `hello`, p2-mac's first answer), an unchanged scheme, a hidden page, reduced motion or
+  without the API; a change during a fade starts a new one, and a fade's late DOM change shows the latest scheme.
+  Nothing theme-related keys off `prefers-color-scheme` once `data-color-scheme` is set (Elanor's tokens use it only
+  without the attribute), so the old snapshot is the old theme. `test/p2/theme.test.ts` (backends, races, picks and
+  the hint before `hello`, fades), `test/p2/first-paint.test.ts` (both first-paint scripts, the hint),
+  `test/p2/ui-shell-frame.test.ts` and `test/p2/ui-theme-fade.test.ts` (a pick fades in Chrome, the first paint not).
 - `push`: one step at the tap; `replace`: lateral changes and server/startup corrections. A correction can pass
   its captured route as `replace(next, expected)` so it cannot overwrite a later queued destination.
 - `close`: whole-modal ×/scrim/Escape, or a sheet/file parent; `reset`: workspace tabs, dropping visited files/commits.
@@ -1658,11 +1690,26 @@ call, hold, method, relay and activation; nothing is measured or walked for it. 
   does). The worker object (`p2.mcp-worker`) sends `setLocations` with every location its conversations work at (the
   session's, active subagents' own) at start, after moves and subagent commits, and whenever the view re-activates (a
   refusal because a newer generation runs ends it), and
-  contributes one Durable extension per configured server, `mcp:<server>` with the code-mode namespace `mcp__<server>`
-  (`createMcpExtensions`, a `self.writable`, rebuilt only when the tool list changes). The namespace's description
-  comes from the configuration only (and the sign-in hint for OAuth servers), so the prompt's code-mode section is the
-  same before and after a server connects (the KV cache holds); a server's `instructions` (`Mcp` version 3, the
-  instance's `instructions`) are reachable through `describeNamespace()`. There is no `mcp_servers` section. Deferred
+  contributes one composing Durable extension, `mcp` (`createMcpExtension`, a `self.writable`, rebuilt only when an
+  instance, its tools, summary or instructions, or a lease change; `Mcp` version 4 gives the worker its `leases`, the
+  instances each location uses, since a project override decides per lease even for instances serving every location).
+  Durable gives every conversation of a worker the same tools, so the extension registers every variant of every tool
+  (a tool as one instance describes it, `toolDescriptor`: title, description, schemas; instances describing it alike
+  share it) and cuts each conversation's view with wraps: the `codemode` section renders, and the `codemode` and
+  `tool_search` tools run (an `api` whose `agent()` is cut; its getters and symbol keys kept), with the servers of the
+  lease at the conversation's location only, each as its own namespace `mcp__<server>` with that instance's summary
+  and instructions. A server only another location has is not there (the main conversation's prompt does not change
+  when a subagent works elsewhere), a variant another location's instance describes is not there, and a call reaches
+  the caller's instance only as the variant it describes (else `MCP tool … is not offered at …`). Names as pi's, the
+  variant the session's lease uses keeping the plain name, other variants of a tool suffixed with a hash of their
+  descriptor. Still the union: Durable's own agent (hooks, `Conversation.agent()`, nested-call resolution, subagent tool
+  choice), and without code mode a loaded tool stays declared after a move. The namespace's description is pi's
+  one-line summary (`mcpServerSummary`: the configured `description` (`Mcp` version 4, the instance's `description`),
+  else the first line of the server's `instructions` (version 3), at most 250 characters), then where the tools are and
+  the sign-in hint for OAuth servers; it changes once when a server without a `description` first sends instructions (a
+  reloaded manager keeps the instructions it listed). The full
+  instructions come from `describeNamespace()`. Without code mode, the `mcp` extension's `mcp_servers` section lists
+  the conversation's servers with their summaries, as pi's does for `tool_search` servers. Deferred
   tools named by `createMcpToolName` (every tool of a colliding name gets the hash suffix, as in pi), results through
   `toLlmContent` and `limitMcpContent`, `structuredOutput` only for tools with an output schema. Without code mode,
   `tool_search` is installed by the worker's registry (`durableRegistry`: once, while code mode is off and any extension
@@ -1671,7 +1718,7 @@ call, hold, method, relay and activation; nothing is measured or walked for it. 
   it: `npm run build:daemon` in `packages/env`, or `PI_ENV_DAEMON`), `mcp-instances.test.ts` (the supervisor with a
   short backoff), `mcp-leases.test.ts`, `mcp-environments.test.ts`, `mcp-project.test.ts`,
   `mcp-windows-command.test.ts`, `mcp-tools.test.ts`, `mcp-worker.test.ts` (fake provider: a project file, `tool_search`,
-  a call, a relocation).
+  a call, a relocation, a subagent's project server kept out of the main conversation, the `mcp_servers` section).
 - **MCP sign-in** (`plugins/mcp/sign-in.ts`, `routes.ts`, `probe.ts`, `pages.ts`, `credentials.ts`; as built:
   `docs/mcp-durable.md` section 4.7): HTTP servers without an `Authorization` header use OAuth with pi-mcp's auth
   provider (stored tokens, refreshed, never a browser) and credentials in `<P2_DATA_DIR>/mcp-auth.json` (0600, keyed like
