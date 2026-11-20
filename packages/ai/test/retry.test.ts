@@ -141,6 +141,24 @@ describe("provider retry classification", () => {
 		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
 	});
 
+	it.each([
+		// Regression for #12227: gateway mid-stream `event: error` frames without a status code.
+		"The provider is temporarily unavailable. Retry shortly.",
+		"The upstream provider is temporarily unavailable. Try again shortly.",
+		"The provider ended the response before it was complete.",
+		"The connection to the provider was reset. Retry shortly.",
+		"The provider reported a failure while generating the response.",
+	])("matches gateway provider failure wording: %s", (errorMessage) => {
+		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
+	});
+
+	it.each(["Provider unavailable for this model", "The provider is unavailable in your region"])(
+		"does not match lasting provider unavailable wording: %s",
+		(errorMessage) => {
+			expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(false);
+		},
+	);
+
 	it("matches gateway wording for a closed connection", () => {
 		// Regression for #12064.
 		const errorMessage = '{"type":"error","error":{"type":"api_error","message":"Connection closed."}}';
@@ -204,6 +222,14 @@ describe("provider retry classification", () => {
 				fauxAssistantMessage("", { stopReason: "error", errorMessage: "524 status code (no body)" }),
 			),
 		).toBe(true);
+		expect(
+			isRetryableAssistantError(
+				fauxAssistantMessage("", {
+					stopReason: "error",
+					errorMessage: "525 <!DOCTYPE html><title>SSL handshake failed</title>",
+				}),
+			),
+		).toBe(true);
 		expect(isRetryableAssistantError(fauxAssistantMessage("not an error"))).toBe(false);
 	});
 
@@ -212,6 +238,30 @@ describe("provider retry classification", () => {
 		'401 {"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"},"request_id":"req_011CU503xyz"}',
 		"400 image exceeds 5 MB maximum: 5316784 bytes > 5242880 bytes",
 	])("does not match status codes inside ids or longer numbers: %s", (errorMessage) => {
+		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(false);
+	});
+
+	it.each([
+		"Unable to process request. Repeat the request later.",
+		"waited 73.4s in queue, reaching this model's admission ceiling of 60s; retry after the hinted delay",
+		'{"type":"error","error":{"details":null,"type":"api_error","message":"Unable to complete this request right now. Please try again."},"request_id":"req_011CgfE1bTgPTDsor4TsApFv"}',
+		"Provider finish_reason: error",
+		"Provider returned an empty response",
+		"Upstream error from Relace: The model stopped before completing the response.",
+	])("retries temporary provider failures: %s", (errorMessage) => {
+		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
+	});
+
+	it.each([
+		// A cancellation, usually the user's.
+		"The operation was aborted",
+		// Only Anthropic's internal error is retried, not other error types.
+		'{"type":"error","error":{"type":"invalid_request_error","message":"messages: at least one message is required"}}',
+		// A refusal ends the stream with a finish reason other than `error`.
+		"Provider finish_reason: content_filter",
+		// The quota exclusions are checked before the retryable patterns.
+		'{"type":"error","error":{"type":"api_error","message":"Monthly quota exceeded"}}',
+	])("does not retry: %s", (errorMessage) => {
 		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(false);
 	});
 });
